@@ -34,11 +34,36 @@ throttle.addEventListener("input", (event) =>{
 	connect();
 });
 
+const opacitySlider = document.getElementById('{uniqueID}_opacity');
+const opacityValue = document.getElementById('{uniqueID}_opacity_value');
+
+function setOpacityText(val){
+	if(val == 0.0)
+		opacityValue.textContent = "0.0 (Marker rendering disabled)";
+	else
+		opacityValue.textContent = val;
+}
+
+opacitySlider.addEventListener('input', () =>  {
+	setOpacityText(opacitySlider.value);
+	saveSettings();
+	drawMarkers();
+});
+
+const namespaceDiv = document.getElementById('{uniqueID}_namespace');
+let disabled_namespaces = new Set();
+
 //Settings
 if(settings.hasOwnProperty("{uniqueID}")){
 	const loaded_data  = settings["{uniqueID}"];
 	topic = loaded_data.topic;
 	throttle.value = loaded_data.throttle ?? 100;
+
+	opacitySlider.value = loaded_data.opacity ?? 1.0;
+	setOpacityText(loaded_data.opacity);
+
+	disabled_namespaces = new Set(loaded_data.disabled_namespaces) ?? new Set();
+	updateNamespaceGUI();
 }else{
 	saveSettings();
 }
@@ -47,11 +72,12 @@ if(settings.hasOwnProperty("{uniqueID}")){
 function saveSettings(){
 	settings["{uniqueID}"] = {
 		topic: topic,
-		throttle: throttle.value
+		throttle: throttle.value,
+		opacity: opacitySlider.value,
+		disabled_namespaces: [...disabled_namespaces]
 	}
 	settings.save();
 }
-
 
 
 //Rendering
@@ -122,6 +148,9 @@ async function drawMarkers(){
 	}
 
 	function drawCubeList(marker, size) {
+		if (!marker.points || marker.points.length === 0)
+			return;
+
 		ctx.scale(marker.scale.x, marker.scale.y);
 
 		const sizeHalf = size / 2;
@@ -184,6 +213,8 @@ async function drawMarkers(){
 	}
 
 	function drawLine(marker, size){
+		if (!marker.points || marker.points.length === 0)
+			return;
 
 		if(!marker.hasOwnProperty("colors") || marker.colors.length == 0)
 			ctx.strokeStyle = rgbaToFillColor(marker.color);
@@ -207,6 +238,9 @@ async function drawMarkers(){
 	}
 
 	function drawLineList(marker, size){
+		if (!marker.points || marker.points.length === 0)
+			return;
+
 		ctx.lineWidth = parseInt(marker.scale.x*size);
 
 		// Draw lines between pairs of points: 0-1, 2-3, 4-5, etc.
@@ -238,6 +272,9 @@ async function drawMarkers(){
 	}
 
 	function drawSphereList(marker, size) {
+		if (!marker.points || marker.points.length === 0)
+			return;
+
 		const radius = (size * marker.scale.x) / 2; // Use scale.x for sphere diameter
 		
 		marker.points.forEach((point, index) => {
@@ -288,8 +325,46 @@ async function drawMarkers(){
 			ctx.strokeText(lines[i], 0, y);
 			ctx.fillText(lines[i], 0, y);
 		}
+
+		// Reset so miter calculation doesn't bug out for other marker types
+		ctx.lineWidth = 1;                   // Default line width
+		ctx.lineJoin = 'miter';              // Default line join
+		ctx.miterLimit = 10;                 // Default miter limit
 	}
 
+	function drawTriangleList(marker, size) {
+		const tris = marker.triangles;
+		if (!tris || tris.length === 0)
+			return;
+
+		// Fast path: single color
+		if (marker.trianglesUniformColor) {
+			ctx.fillStyle = marker.triangles[0].color;
+			ctx.beginPath();
+
+			for (const tri of tris) {
+				ctx.moveTo(tri.p0.x * size, -tri.p0.y * size);
+				ctx.lineTo(tri.p1.x * size, -tri.p1.y * size);
+				ctx.lineTo(tri.p2.x * size, -tri.p2.y * size);
+				ctx.closePath();
+			}
+
+			ctx.fill();
+			return;
+		}
+
+		// Fallback: per-triangle color
+		for (const tri of tris) {
+			ctx.fillStyle = tri.color;
+
+			ctx.beginPath();
+			ctx.moveTo(tri.p0.x * size, -tri.p0.y * size);
+			ctx.lineTo(tri.p1.x * size, -tri.p1.y * size);
+			ctx.lineTo(tri.p2.x * size, -tri.p2.y * size);
+			ctx.closePath();
+			ctx.fill();
+		}
+	}
 
 
 	const unit = view.getMapUnitsInPixels(1.0);
@@ -300,21 +375,33 @@ async function drawMarkers(){
 	ctx.setTransform(1,0,0,1,0,0);
 	ctx.clearRect(0, 0, wid, hei);
 
+	ctx.globalAlpha = opacitySlider.value;
+
+	if(opacitySlider.value == 0.0){
+		return;
+	}
+
 	let current_time = new Date();
 
 	for (const key of z_sorted_keys) {
 		const marker = markers[key];
+		const ns = marker.ns || '';
+
+		if (disabled_namespaces.has(ns))
+			continue;
 		
 		ctx.fillStyle = rgbaToFillColor(marker.color);
 
-		const frame = tf.absoluteTransforms[marker.header.frame_id];
+		const frame = tf.getAbsoluteTransform(marker.header);
 
 		if(!frame)
 			continue;
 
-		//skip old markers
-		if((current_time - marker.stamp) / 1000.0 > marker.lifetime.sec + marker.lifetime.nanosec*1e-9)
-			continue;
+
+		//skip old markers (only if lifetime is not 0/infinite)
+        const isInfiniteLifetime = marker.lifetime.sec === 0 && marker.lifetime.nanosec === 0;
+        if (!isInfiniteLifetime && (current_time - marker.stamp) / 1000.0 > marker.lifetime.sec + marker.lifetime.nanosec * 1e-9)
+            continue;
 
 		const pos = view.fixedToScreen({
 			x: marker.transformed.translation.x,
@@ -337,7 +424,7 @@ async function drawMarkers(){
 			case 8: status.setWarn("POINTS markers are not supported yet."); break; //POINTS=8
 			case 9: drawText(marker, unit); break;//TEXT_VIEW_FACING=9
 			case 10: status.setWarn("MESH_RESOURCE markers are not supported yet."); break; //MESH_RESOURCE=10
-			case 11: status.setWarn("TRIANGLE_LIST markers are not supported yet."); break; //TRIANGLE_LIST=11
+			case 11: ctx.setTransform(1, 0, 0, 1, pos.x, pos.y); drawTriangleList(marker, unit); break; //TRIANGLE_LIST=11
 		}
 	}
 }
@@ -359,7 +446,8 @@ function connect(){
 		name : topic,
 		messageType : 'visualization_msgs/msg/MarkerArray',
 		compression: rosbridge.compression,
-		throttle_rate: parseInt(throttle.value)
+		throttle_rate: parseInt(throttle.value),
+		queue_length: 1
 	});
 
 	status.setWarn("No data received.");
@@ -391,13 +479,91 @@ function connect(){
 				m.header.frame_id = tf.fixed_frame;
 				error = true;
 			}
-		
-			m.transformed = tf.transformPose(
-				m.header.frame_id, 
-				tf.fixed_frame, 
+
+			m.transformed = tf.transformPoseStamped(
+				m.header,
 				m.pose.position, 
 				m.pose.orientation
 			);
+
+			//preprocess triangle_lists for correct 3D rotation and colour
+			if (m.type === 11 && m.points && m.points.length > 0) {
+				const {x, y, z, w} = m.transformed.rotation;
+
+				//rotate and scale matrix
+				const r00 = 1 - 2*(y*y + z*z);
+				const r01 = 2*(x*y - w*z);
+				const r02 = 2*(x*z + w*y);
+				const r10 = 2*(x*y + w*z);
+				const r11 = 1 - 2*(x*x + z*z);
+				const r12 = 2*(y*z - w*x);
+				const r20 = 2*(x*z - w*y);
+				const r21 = 2*(y*z + w*x);
+				const r22 = 1 - 2*(x*x + y*y);
+
+				const hasVertexColors = m.colors && m.colors.length === m.points.length;
+				const hasFaceColors = m.colors && m.colors.length === m.points.length / 3;
+				const globalAlpha = m.color.a > 0 ? m.color.a : 1.0;
+
+				const triangles = [];
+				for (let i = 0; i < m.points.length - 2; i += 3) {
+					const pts = [];
+
+					for (let j = 0; j < 3; j++) {
+						const p = m.points[i + j];
+
+						const sx = p.x * m.scale.x;
+						const sy = p.y * m.scale.y;
+						const sz = p.z * m.scale.z;
+
+						const rx = r00*sx + r01*sy + r02*sz;
+						const ry = r10*sx + r11*sy + r12*sz;
+						const rz = r20*sx + r21*sy + r22*sz;
+
+						pts.push({ x: rx, y: ry, z: rz });
+					}
+
+					const avgZ = (pts[0].z + pts[1].z + pts[2].z) / 3;
+
+					let color;
+					if (hasVertexColors) {
+						const c = m.colors[i];
+						color = `rgba(${Math.round(c.r*255)}, ${Math.round(c.g*255)}, ${Math.round(c.b*255)}, ${globalAlpha * c.a})`;
+					}else if (hasFaceColors) {
+						const c = m.colors[i / 3];
+						color = `rgba(${Math.round(c.r*255)}, ${Math.round(c.g*255)}, ${Math.round(c.b*255)}, ${globalAlpha * c.a})`;
+					}else {
+						color = rgbaToFillColor(m.color);
+					}
+
+					triangles.push({
+						p0: pts[0],
+						p1: pts[1],
+						p2: pts[2],
+						avgZ,
+						color
+					});
+				}
+
+				//can we render the whole thing in one draw call?
+				let uniformColor = true;
+				let firstColor = triangles.length > 0 ? triangles[0].color : null;
+
+				for (let i = 1; i < triangles.length; i++) {
+					if (triangles[i].color !== firstColor) {
+						uniformColor = false;
+						break;
+					}
+				}
+
+				// Z sorting (back → front), only if there's different colours
+				if (!uniformColor){
+					triangles.sort((a, b) => a.avgZ - b.avgZ);
+				}
+
+				m.isUniformColor = uniformColor;
+				m.triangles = triangles;
+			}
 
 			m.stamp = new Date();	
 			markers[id] = m;
@@ -416,6 +582,37 @@ function connect(){
 	});
 
 	saveSettings();
+	updateNamespaceGUI();
+}
+
+function updateNamespaceGUI() {
+	const seen = new Set(Object.values(markers).map(m => m.ns || ''));
+
+	namespaceDiv.innerHTML = '';
+	for (const ns of [...seen].sort()) {
+		const label = ns === '' ? 'No namespace' : ns;
+		const checkbox = document.createElement('input');
+		checkbox.type = 'checkbox';
+		checkbox.id = `{uniqueID}_ns_${ns}`;
+		checkbox.checked = !disabled_namespaces.has(ns);
+		checkbox.addEventListener('change', (e) => {
+			if (e.target.checked)
+				disabled_namespaces.delete(ns);
+			else
+				disabled_namespaces.add(ns);
+			saveSettings();
+			drawMarkers();
+		});
+		const labelEl = document.createElement('label');
+		labelEl.htmlFor = checkbox.id;
+		labelEl.textContent = ` ${label}`;
+		const div = document.createElement('div');
+		div.classList.add('tf_label');
+		div.appendChild(checkbox);
+		div.appendChild(labelEl);
+		div.classList.add('param_toggle_label');
+		namespaceDiv.appendChild(div);
+	}
 }
 
 async function loadTopics(){
@@ -454,6 +651,7 @@ selectionbox.addEventListener("click", (event) => {
 
 icon.addEventListener("click", (event) => {
 	loadTopics();
+	updateNamespaceGUI();
 });
 
 loadTopics();

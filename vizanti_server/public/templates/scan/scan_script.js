@@ -182,7 +182,8 @@ function connect(){
 		name : topic,
 		messageType : 'sensor_msgs/msg/LaserScan',
 		throttle_rate: parseInt(throttle.value),
-		compression: rosbridge.compression
+		compression: rosbridge.compression,
+		queue_length: 1
 	});
 
 	status.setWarn("No data received.");
@@ -203,8 +204,8 @@ function connect(){
 			error = true;
 		}
 
-		const pose = tf.absoluteTransforms[msg.header.frame_id];
-
+		let pose = tf.getAbsoluteTransform(msg.header);
+		
 		if(!pose){
 			status.setError("Required transform frame \""+msg.header.frame_id+"\" not found.");
 			return;

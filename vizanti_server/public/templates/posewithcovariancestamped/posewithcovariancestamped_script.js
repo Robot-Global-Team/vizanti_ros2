@@ -338,7 +338,8 @@ function connect(){
 		ros : rosbridge.ros,
 		name : topic,
 		messageType : typedict[topic],
-		throttle_rate: parseInt(throttle.value)
+		throttle_rate: parseInt(throttle.value),
+		queue_length: 1
 	});
 
 	status.setWarn("No data received.");
@@ -372,9 +373,8 @@ function connect(){
 			q = new Quaternion();
 		}
 
-		const transformed = tf.transformPose(
-			msg.header.frame_id, 
-			tf.fixed_frame, 
+		const transformed = tf.transformPoseStamped(
+			msg.header,
 			pose.position, 
 			q
 		);

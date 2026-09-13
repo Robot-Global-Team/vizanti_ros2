@@ -79,6 +79,9 @@ async function drawLines(relative, absolute){
 	Object.keys(absolute).forEach(key => {
 
 		let transform = absolute[key];
+		if (!transform || !transform.translation) {
+			return;
+		}
 
 		let point = view.fixedToScreen({
 			x: transform.translation.x,
@@ -119,6 +122,9 @@ async function drawText(absolute){
 	Object.keys(absolute).forEach(key => {
 
 		let transform = absolute[key];
+		if (!transform || !transform.translation) {
+			return;
+		}
 
 		let point = view.fixedToScreen({
 			x: transform.translation.x,
@@ -177,13 +183,15 @@ function drawAxes(absolute) {
 	const lineWidth = 2 * parseFloat(scaleSlider.value);
 	
 	const frame_keys = Object.keys(absolute);
-	const vectors = new Array(frame_keys.length);
-	
+	const vectors = [];
+
 	for (let i = 0; i < frame_keys.length; i++) {
 		const transform = absolute[frame_keys[i]];
-		vectors[i] = getBasis(transform.rotation, transform.translation, unit);
+		if (!transform || !transform.translation || !transform.rotation) {
+			continue;
+		}
+		vectors.push(getBasis(transform.rotation, transform.translation, unit));
 	}
-
 	ctx.lineWidth = lineWidth;
 
 	// Red X
@@ -343,7 +351,6 @@ function updateGUI(){
 			addSpan('(origin)', 'darkgray');
 		}
 
-
 		const div = document.createElement('div');
 		div.classList.add('tf_label');
 		div.appendChild(checkbox);
@@ -387,16 +394,17 @@ document.getElementById('{uniqueID}_enable_all').addEventListener('click',  asyn
 	updateGUI();
 });
 
-document.getElementById('{uniqueID}_standard_only').addEventListener('click',  async () => {
-	const standard_frames = ["world", "earth", "map", "odom", "base_link", "base_footprint", "laser", "base_stabilized"];
+document.getElementById('{uniqueID}_standard_only').addEventListener('click', async () => {
+	const standard_frames = ["world", "earth", "map", "odom", "base_link", "base_footprint", "base_stabilized"];
 	const hasStandardFrame = (str) => standard_frames.some(frame => str.includes(frame));
 
-	for (const [key, value] of Object.entries(frame_visibility)) {
-		frame_visibility[key] = hasStandardFrame(key);
+	for (const key of Object.keys(frame_visibility)) {
+		const isOrigin = tf.transforms[key] === undefined;
+		frame_visibility[key] = isOrigin || hasStandardFrame(key);
 	}
+
 	saveSettings();
 	updateGUI();
-
 });
 
 document.getElementById('{uniqueID}_disable_all').addEventListener('click',  async () => {

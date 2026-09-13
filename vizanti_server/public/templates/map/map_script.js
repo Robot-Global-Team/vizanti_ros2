@@ -14,49 +14,6 @@ let imageToDataURL = utilModule.imageToDataURL;
 let Status = StatusModule.Status;
 let params = paramsModule.default;
 
-
-async function saveMap(save_path, topic) {
-	const saveMapService = new ROSLIB.Service({
-		ros: rosbridge.ros,
-		name: "/vizanti/save_map",
-		serviceType: "vizanti_msgs/srv/SaveMap",
-	});
-
-	const request = new ROSLIB.ServiceRequest({
-		file_path: save_path,
-		topic: topic
-	});
-
-	return new Promise((resolve, reject) => {
-		saveMapService.callService(request, (result) => {
-			resolve(result);
-		}, (error) => {
-			reject(error);
-		});
-	});
-}
-
-async function loadMap(load_path, topic) {
-	const loadMapService = new ROSLIB.Service({
-		ros: rosbridge.ros,
-		name: "/vizanti/load_map",
-		serviceType: "vizanti_msgs/srv/LoadMap",
-	});
-
-	const request = new ROSLIB.ServiceRequest({
-		file_path: load_path,
-		topic: topic,
-	});
-
-	return new Promise((resolve, reject) => {
-		loadMapService.callService(request, (result) => {
-			resolve(result);
-		}, (error) => {
-			reject(error);
-		});
-	});
-}
-
 let topic = getTopic("{uniqueID}");
 let status = new Status(
 	document.getElementById("{uniqueID}_icon"),
@@ -69,6 +26,7 @@ icons["costmap"] = await imageToDataURL("assets/costmap.svg");
 icons["raw"] = await imageToDataURL("assets/rawmap.svg");
 icons["raw_transparent"] = await imageToDataURL("assets/rawmap_transparent_white.svg");
 icons["raw_transparent_black"] = await imageToDataURL("assets/rawmap_transparent_black.svg");
+icons["sonar"] = await imageToDataURL("assets/sonar.svg");
 
 let listener = undefined;
 let map_topic = undefined;
@@ -110,10 +68,7 @@ opacitySlider.addEventListener('input', () =>  {
 const loadPathBox = document.getElementById("{uniqueID}_loadpath");
 const loadTopicBox = document.getElementById("{uniqueID}_loadtopic");
 const savePathBox = document.getElementById("{uniqueID}_savepath");
-const loadButton = document.getElementById('{uniqueID}_load');
-const saveButton = document.getElementById('{uniqueID}_save');
 
-//rendring colour modes: 0 = map, 1 = costmap, 2 = raw
 const colourSchemeBox = document.getElementById('{uniqueID}_colour_scheme');
 colourSchemeBox.selectedIndex = topic.includes("cost") ? 1 : 0;
 colourSchemeBox.addEventListener('change', saveSettings);
@@ -125,44 +80,6 @@ const throttle = document.getElementById('{uniqueID}_throttle');
 throttle.addEventListener("input", (event) =>{
 	saveSettings();
 	connect();
-});
-
-loadButton.addEventListener('click',  async () => {
-	let path = loadPathBox.value;
-
-	if (path.endsWith(".pgm")) {
-		path = path.slice(0, -4) + ".yaml";
-	} else if (!path.endsWith(".yaml")) {
-		path += ".yaml";
-	}
-
-	loadPathBox.value = path;
-
-	try {
-		const result = await loadMap(path, loadTopicBox.value);
-		alert(result.message);
-	} catch (error) {
-		alert(error);
-	}
-});
-
-saveButton.addEventListener('click', async () => {
-	let path = savePathBox.value;
-
-	if (path.endsWith(".pgm")) {
-		path = path.slice(0, -4);
-	} else if (path.endsWith(".yaml")) {
-		path = path.slice(0, -5);
-	}
-
-	savePathBox.value = path;
-
-	try {
-		const result = await saveMap(path, topic);
-		alert(result.message);
-	} catch (error) {
-		alert(error);
-	}
 });
 
 const canvas = document.getElementById('{uniqueID}_canvas');
@@ -225,9 +142,8 @@ async function drawMap(){
 	let tf_pose = map_data.pose;
 
 	if(!timestampCheckbox.checked){
-		tf_pose = tf.transformPose(
-			map_data.header.frame_id,
-			tf.fixed_frame,
+		tf_pose = tf.transformPoseStamped(
+			map_data.header,
 			map_data.info.origin.position,
 			map_data.info.origin.orientation
 		);
@@ -264,14 +180,14 @@ function connect(){
 		name : topic,
 		messageType : 'nav_msgs/msg/OccupancyGrid',
 		throttle_rate: parseInt(throttle.value), // throttle to once every two seconds max
-		compression: rosbridge.compression
+		compression: rosbridge.compression,
+		queue_length: 1
 	});
 
 	status.setWarn("No data received.");
 
 	worker_thread.onmessage = (e) => {
 		setTimeout(()=>{
-
 			const img = e.data.image
 			temp_canvas.width = img.width
 			temp_canvas.height = img.height
@@ -279,7 +195,7 @@ function connect(){
 			map_data = new_map_data;
 			drawMap();
 			status.setOK();
-		},12);
+		},1);
 	};
 	
 	listener = map_topic.subscribe((msg) => {
@@ -295,8 +211,20 @@ function connect(){
 		}
 
 		if(!tf.absoluteTransforms[msg.header.frame_id]){
-			status.setError("Required transform frame \""+msg.header.frame_id+"\" not found.");
-			return;
+			if(msg.header.frame_id == "map"){
+				status.setWarn("Map transform not available yet, using identity transform.");
+
+				//add a temporary transform so one can send an initialpose relative to it
+				tf.absoluteTransforms[msg.header.frame_id] = {
+					translation: {x: 0, y:0, z:0},
+					rotation: new Quaternion()
+				}
+				tf.frame_list.add("map");
+
+			}else{
+				status.setError("Required transform frame \""+msg.header.frame_id+"\" not found.");
+				return;
+			}
 		}
 
 		queueWorkerMsg(msg);
@@ -307,15 +235,13 @@ function connect(){
 }
 
 function queueWorkerMsg(msg){
-	msg.pose = tf.transformPose(
-		msg.header.frame_id,
-		tf.fixed_frame,
-		msg.info.origin.position,
+	msg.pose = tf.transformPoseStamped(
+		msg.header,
+		msg.info.origin.position, 
 		msg.info.origin.orientation
 	);
 
 	new_map_data = msg;
-	map_data = undefined;
 
 	worker_thread.postMessage({
 		map_msg: msg,

@@ -7,17 +7,19 @@ def generate_launch_description():
     base_url = launch.substitutions.LaunchConfiguration('base_url', default='') #e.g. /vizanti
     port = launch.substitutions.LaunchConfiguration('port', default=5000)
     port_rosbridge = launch.substitutions.LaunchConfiguration('port_rosbridge', default=5001)
-    flask_debug = launch.substitutions.LaunchConfiguration('flask_debug', default=True)
+    flask_debug = launch.substitutions.LaunchConfiguration('flask_debug', default=False)
     default_widget_config = launch.substitutions.LaunchConfiguration('default_widget_config', default='') #e.g. ~/your_custom_config.json
 
     #rosbridge internal params
-    websocket_ping_interval = launch.substitutions.LaunchConfiguration('websocket_ping_interval', default='4')
-    websocket_ping_timeout = launch.substitutions.LaunchConfiguration('websocket_ping_timeout', default='15')
+    send_action_goals_in_new_thread = launch.substitutions.LaunchConfiguration('send_action_goals_in_new_thread', default='true')
+    call_services_in_new_thread = launch.substitutions.LaunchConfiguration('call_services_in_new_thread', default='true')
     unregister_timeout = launch.substitutions.LaunchConfiguration('unregister_timeout', default='9999999.9')
     retry_startup_delay = launch.substitutions.LaunchConfiguration('retry_startup_delay', default='10.0')
     fragment_timeout = launch.substitutions.LaunchConfiguration('fragment_timeout', default='30')
     delay_between_messages = launch.substitutions.LaunchConfiguration('delay_between_messages', default='0.0')
     max_message_size = launch.substitutions.LaunchConfiguration('max_message_size', default='999999999')
+    websocket_ping_interval = launch.substitutions.LaunchConfiguration('websocket_ping_interval', default='4.0')
+    websocket_ping_timeout = launch.substitutions.LaunchConfiguration('websocket_ping_timeout', default='15.0')
 
     rosbridge_node = launch_ros.actions.Node(
         name='vizanti_rosbridge',
@@ -35,7 +37,9 @@ def generate_launch_description():
             {'unregister_timeout': unregister_timeout},
             {'use_compression': True},
             {'websocket_ping_interval': websocket_ping_interval},
-            {'websocket_ping_timeout': websocket_ping_timeout}
+            {'websocket_ping_timeout': websocket_ping_timeout},
+            {'send_action_goals_in_new_thread': send_action_goals_in_new_thread},
+            {'call_services_in_new_thread': call_services_in_new_thread}
         ]
     )
 

@@ -2,8 +2,13 @@
 
 import os
 import rclpy
-import cv2
+import sys
 import numpy as np
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 
 from rclpy.node import Node
 from nav_msgs.msg import OccupancyGrid
@@ -35,10 +40,7 @@ class ImageToOccupancyGrid(Node):
         print(absolute_path)
         image = cv2.imread(absolute_path, cv2.IMREAD_GRAYSCALE)
 
-        # Flatten the image and convert to occupancy grid data
-        data = []
-        for pixel in image.flatten():
-            data.append(pixel)
+        data = np.asarray(image, dtype=np.uint8).flatten().view(np.int8)
 
         # Create OccupancyGrid message
         grid = OccupancyGrid()
@@ -53,7 +55,7 @@ class ImageToOccupancyGrid(Node):
         grid.info.origin.position.y = 0.0
         grid.info.origin.position.z = 0.0
         grid.info.origin.orientation.w = 1.0
-        grid.data = np.array(data, dtype=np.int8).tolist()
+        grid.data = data.tolist()
 
         qos_profile = QoSProfile(depth=1)
         qos_profile.durability = QoSDurabilityPolicy.TRANSIENT_LOCAL
@@ -66,6 +68,9 @@ class ImageToOccupancyGrid(Node):
 
 
 def main(args=None):
+    if cv2 is None:
+        sys.exit("python3-opencv is not installed, cannot run the occupancy grid demo")
+
     rclpy.init(args=args)
     node = ImageToOccupancyGrid()
     try:

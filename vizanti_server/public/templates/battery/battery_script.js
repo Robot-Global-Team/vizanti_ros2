@@ -75,7 +75,7 @@ const CHEMISTRY = [
 const selectionbox = document.getElementById("{uniqueID}_topic");
 const icon = document.getElementById("{uniqueID}_icon").getElementsByTagName('img')[0];
 
-const text_percent = document.getElementById("{uniqueID}_pecentage");
+const text_percent = document.getElementById("{uniqueID}_percentage");
 const text_voltage = document.getElementById("{uniqueID}_voltage");
 const text_cell_voltage = document.getElementById("{uniqueID}_cell_voltage");
 const text_current = document.getElementById("{uniqueID}_current");
@@ -104,7 +104,8 @@ function connect(){
 		name : topic,
 		messageType : 'sensor_msgs/msg/BatteryState',
 		throttle_rate: 500, // throttle to twice a second max
-		compression: rosbridge.compression
+		compression: rosbridge.compression,
+		queue_length: 1
 	});
 
 	status.setWarn("No data received.");

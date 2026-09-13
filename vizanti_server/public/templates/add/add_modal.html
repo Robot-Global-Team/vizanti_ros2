@@ -83,7 +83,15 @@
 				<img src="assets/inspector.svg" alt="Topic Inspector" class="card_icon">
 				<div class="card">
 					<b class="card_title">Topic Inspector</b>
-					<p class="card_desc">View messages as text</p>
+					<p class="card_desc">View raw messages as text</p>
+				</div>
+			</div>
+
+			<div class="widget_entry" onclick="addWidget('diagnostics','')" data-topic="diagnostic_msgs/msg/DiagnosticArray,rcl_interfaces/msg/Log">
+				<img src="assets/diagnostics.svg" alt="Diagnostics" class="card_icon">
+				<div class="card">
+					<b class="card_title">Diagnostics</b>
+					<p class="card_desc">Monitor [diagnostic_msgs/DiagnosticArray] or [rcl_interfaces/Log]</p>
 				</div>
 			</div>
 
@@ -121,10 +129,18 @@
 				</div>
 			</div>
 
+			<div class="widget_entry" onclick="addWidget('survey','')" data-topic="nav_msgs/msg/Path,geometry_msgs/msg/PoseArray">
+				<img src="assets/survey.svg" alt="Survey" class="card_icon">
+				<div class="card">
+					<b class="card_title">Survey Mission</b>
+					<p class="card_desc">Generate a grid pattern inside a polygon, as a [nav_msgs/Path] or [geometry_msgs/PoseArray]</p>
+				</div>
+			</div>
+
 			<div class="widget_entry" onclick="addWidget('area','')" data-topic="geometry_msgs/msg/PolygonStamped">
 				<img src="assets/area.svg" alt="Area" class="card_icon">
 				<div class="card">
-					<b class="card_title">Area Mission</b>
+					<b class="card_title">Bounding Box</b>
 					<p class="card_desc">Send vertices of a box [geometry_msgs/PolygonStamped]</p>
 				</div>
 			</div>
@@ -137,7 +153,7 @@
 				</div>
 			</div>
 
-			<div class="widget_entry" onclick="addWidget('altimeter','')" data-topic="std_msgs/msg/Float32">
+			<div class="widget_entry" onclick="addWidget('altimeter','')">
 				<img src="assets/altimeter.svg" alt="Altimeter" class="card_icon">
 				<div class="card">
 					<b class="card_title">Altimeter</b>
@@ -181,9 +197,9 @@
 			</div>
 
 			<div class="widget_entry" onclick="addWidget('satelite','')" data-topic="sensor_msgs/msg/NavSatFix">
-				<img src="assets/satelite.svg" alt="Satelite" class="card_icon">
+				<img src="assets/satelite.svg" alt="Satellite" class="card_icon">
 				<div class="card">
-					<b class="card_title">Satelite Tiles</b>
+					<b class="card_title">Satellite Tiles</b>
 					<p class="card_desc">sensor_msgs/NavSatFix</p>
 				</div>
 			</div>
@@ -254,11 +270,11 @@
 				</div>
 			</div>
 
-			<div class="widget_entry" onclick="addWidget('posearray','')" data-topic="geometry_msgs/msg/PoseArray">
+			<div class="widget_entry" onclick="addWidget('posearray','')" data-topic="geometry_msgs/msg/PoseArray,nav2_msgs/msg/ParticleCloud">
 				<img src="assets/posearray.svg" alt="PoseArray" class="card_icon">
 				<div class="card">
 					<b class="card_title">Pose Array</b>
-					<p class="card_desc">geometry_msgs/PoseArray</p>
+					<p class="card_desc">geometry_msgs/PoseArray, nav2_msgs/ParticleCloud</p>
 				</div>
 			</div>
 

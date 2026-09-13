@@ -10,15 +10,10 @@ class Rosbridge {
 		this.port = params.port_rosbridge;
 		this.compression = params.compression;
 		this.connected = false;
-
-		this.connect();
+		this.reconnect_pending = false;
+		this.suspended = false;
+		this.suspend_timer = undefined;
 		this.status = "Connecting...";
-
-		this.reset_reconnect = false;
-	}
-
-	connect(){
-		this.connected = false;
 
 		this.ros = new ROSLIB.Ros({
 			url: 'ws://' + this.url + ':' + this.port
@@ -26,14 +21,8 @@ class Rosbridge {
 
 		this.ros.on('connection', () => {
 			console.log('Connected to robot.');
-
 			this.connected = true;
 			this.status = "Connected.";
-
-			if(this.reset_reconnect){
-				location.reload(false); //otherwise topics won't re-subscribe automatically :/
-			}
-
 			window.dispatchEvent(new Event('rosbridge_change'));
 		});
 
@@ -46,13 +35,35 @@ class Rosbridge {
 		this.ros.on('close', () => {
 			this.connected = false;
 			this.status = "Connection lost.";
-			this.reset_reconnect = true;
 			window.dispatchEvent(new Event('rosbridge_change'));
 
+			if (this.suspended || this.reconnect_pending)
+				return;
+
+			this.reconnect_pending = true;
 			setTimeout(() => {
+				this.reconnect_pending = false;
+				if (this.suspended)
+					return;
 				this.status = "Reconnecting...";
-				this.connect();
+				window.dispatchEvent(new Event('rosbridge_change'));
+				this.ros.connect('ws://' + this.url + ':' + this.port);
 			}, 1000);
+		});
+
+		document.addEventListener('visibilitychange', () => {
+			if (document.hidden) {
+				this.suspended = true;
+				this.status = "Suspended (tab inactive).";
+				setTimeout(() => this.ros.close(), 5);
+			} else {
+				if (this.suspended) {
+					this.suspended = false;
+					this.status = "Reconnecting...";
+					window.dispatchEvent(new Event('rosbridge_change'));
+					this.ros.connect('ws://' + this.url + ':' + this.port);
+				}
+			}
 		});
 
 		this.topics_client = new ROSLIB.Service({

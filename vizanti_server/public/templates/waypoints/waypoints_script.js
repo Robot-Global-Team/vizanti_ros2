@@ -19,6 +19,7 @@ let status = new Status(
 let typedict = {};
 let fixed_frame = tf.fixed_frame;
 let base_link_frame = find_base_frame();
+let path_publisher = undefined;
 let mode = "IDLE";
 let points = [];
 let shift_pressed = false;
@@ -62,6 +63,85 @@ deleteButton.addEventListener('click', async ()=>{
 startCheckbox.addEventListener('change', ()=>{
 	drawWaypoints();
 	saveSettings();
+});
+
+const importCSVButton = document.getElementById("{uniqueID}_importcsv");
+const importCSVInput = document.getElementById("{uniqueID}_importcsv_input");
+
+importCSVButton.addEventListener('click', ()=>{
+	importCSVInput.click();
+});
+
+importCSVInput.addEventListener('change', async (event)=>{
+
+	const file = event.target.files[0];
+	if(!file){
+		return;
+	}
+
+	try{
+		const text = await file.text();
+		const lines = text.split(/\r?\n/).map(line => line.trim()).filter(line => line.length > 0);
+
+		if(lines.length < 2){
+			status.setError("CSV file is empty.");
+			return;
+		}
+
+		const headers = lines[0].split(",").map(h => h.trim().toLowerCase());
+		const xIndex = headers.findIndex(h => h === "x");
+		const yIndex = headers.findIndex(h => h === "y");
+		const zIndex = headers.findIndex(h => h === "z");
+
+		if(xIndex < 0 || yIndex < 0){
+			status.setError("CSV must contain X and Y columns.");
+			return;
+		}
+
+		const imported_points = [];
+
+		for(let i = 1; i < lines.length; i++){
+
+			const cols = lines[i].split(",").map(c => c.trim());
+			const x = parseFloat(cols[xIndex]);
+			const y = parseFloat(cols[yIndex]);
+
+			let z = 0;
+			if(zIndex >= 0){
+				z = parseFloat(cols[zIndex]);
+				if(Number.isNaN(z)){
+					z = 0;
+				}
+			}
+
+			if(Number.isNaN(x) || Number.isNaN(y)){
+				continue;
+			}
+
+			imported_points.push({
+				x: x,
+				y: y,
+				z: z
+			});
+		}
+
+		if(imported_points.length === 0){
+			status.setError("No valid points found in CSV.");
+			return;
+		}
+
+		points = imported_points;
+
+		drawWaypoints();
+		saveSettings();
+		status.setOK(`Imported ${points.length} waypoints.`);
+
+	}catch(error){
+		console.error(error);
+		status.setError("Failed to import CSV.");
+	}
+
+	importCSVInput.value = "";
 });
 
 // Settings
@@ -185,7 +265,11 @@ function sendMessage(pointlist){
 		}
 	}
 
-	const publisher = new ROSLIB.Topic({
+	if(path_publisher !== undefined){
+		path_publisher.unadvertise();
+	}
+
+	path_publisher = new ROSLIB.Topic({
 		ros: rosbridge.ros,
 		name: topic,
 		messageType: stamped ? 'nav_msgs/msg/Path' : 'geometry_msgs/msg/PoseArray',
@@ -200,7 +284,7 @@ function sendMessage(pointlist){
 		poses: poseList
 	});
 	
-	publisher.publish(pathMessage);
+	path_publisher.publish(pathMessage);
 	status.setOK();
 
 	setMode("IDLE");
@@ -762,7 +846,9 @@ function endDrag(event){
 
 		start_stamp = new Date("2010-3-2"); //debounce, and also when ROS box turtle was released
 
-		let { clientX, clientY } = event.touches ? event.touches[0] : event;
+		// touchend has empty event.touches — must read from changedTouches
+		const touch = event.changedTouches?.[0] ?? event.touches?.[0] ?? event;
+		let { clientX, clientY } = touch;
 
 		if(shift_pressed){
 			clientX = Math.round(clientX/20) * 20;

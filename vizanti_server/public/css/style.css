@@ -205,7 +205,9 @@ object {
 	overflow-y: hidden;
 	scrollbar-width: none;
 	display: block;
-	position: relative;
+	position: fixed;
+	top: 0;
+	left: 0;
 	transition: height 0.1s;
 	z-index: 10;
 	-ms-overflow-style: none;
@@ -446,6 +448,14 @@ object {
 	margin-left: 1.5em;
 }
 
+
+.param_toggle_label {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: 3px 5px;
+	border-radius: 3px;
+}
 
 /* Input box */
 
@@ -1106,6 +1116,18 @@ li {
 	flex-shrink: 0;
 }
 
+.joy_text {
+	position: fixed;
+	font-weight: bold;
+    font-size: 1.5em;
+	opacity: 1.0;
+	color: black;
+	transform: translate(-50%, -50%);
+	pointer-events: none;
+	z-index: 30;
+	display: none;
+}
+
 /*
 
 .axis_dropdown_group {
@@ -1202,4 +1224,130 @@ li {
     0% { opacity: 1; }
     50% { opacity: 0.7; }
     100% { opacity: 1; }
+}
+
+
+/* Diagnostics */
+
+.diagnostics_toolbar {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 8px;
+	margin: 4px 0px;
+}
+
+.diagnostics_button {
+	min-width: 80px;
+}
+
+.diagnostics_summary {
+	font-size: 12px;
+	opacity: 0.7;
+}
+
+.diagnostics_display {
+	font-size: 13px;
+	overflow: auto;
+}
+
+.diagnostics_group {
+	padding: 2px 0px;
+}
+
+.diagnostics_group > summary {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	cursor: pointer;
+	padding: 2px 0px;
+}
+
+.diagnostics_group[data-solo="true"] > summary {
+	list-style: none;
+	cursor: default;
+}
+
+.diagnostics_group[data-solo="true"] > summary::-webkit-details-marker {
+	display: none;
+}
+
+.diagnostics_badge {
+	color: #ffffff;
+	border-radius: 3px;
+	padding: 0px 5px;
+	font-size: 11px;
+	flex-shrink: 0;
+}
+
+.diagnostics_name {
+	font-weight: bold;
+	flex-shrink: 0;
+}
+
+.diagnostics_sub {
+	flex: 1;
+	opacity: 0.7;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.diagnostics_age {
+	font-size: 11px;
+	opacity: 0.5;
+	font-variant-numeric: tabular-nums;
+	flex-shrink: 0;
+}
+
+.diagnostics_entries {
+	padding: 2px 0px 6px 18px;
+}
+
+.diagnostics_entry {
+	display: flex;
+	gap: 8px;
+	padding: 1px 0px;
+}
+
+.diagnostics_key {
+	min-width: 160px;
+	opacity: 0.75;
+	flex-shrink: 0;
+}
+
+.diagnostics_value {
+	white-space: nowrap;
+	flex-shrink: 0;
+}
+
+.diagnostics_log_entry {
+	padding: 0px;
+}
+
+.diagnostics_location {
+	font-size: 11px;
+	opacity: 0.85;
+	padding: 3px 0px 0px 0px;
+}
+
+.diagnostics_line {
+	display: flex;
+	align-items: flex-start;
+	gap: 8px;
+	padding: 1px 0px 3px 0px;
+}
+
+.diagnostics_gutter {
+	display: flex;
+	flex-direction: column;
+	align-items: flex-end;
+	width: 52px;
+	flex-shrink: 0;
+}
+
+.diagnostics_dup {
+	font-size: 11px;
+	opacity: 0.6;
+	font-variant-numeric: tabular-nums;
 }

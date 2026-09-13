@@ -289,7 +289,8 @@ function connect(){
 		name : topic,
 		messageType : 'sensor_msgs/msg/PointCloud2',
 		throttle_rate: parseInt(throttle.value),
-		compression: rosbridge.compression
+		compression: rosbridge.compression,
+		queue_length: 1
 	});
 
 	status.setWarn("No data received.");
@@ -303,8 +304,7 @@ function connect(){
 			error = true;
 		}
 
-		const pose = tf.absoluteTransforms[msg.header.frame_id];
-		if(!pose){
+		if(!tf.absoluteTransforms[msg.header.frame_id]){
 			status.setError("Required transform frame \""+msg.header.frame_id+"\" not found.");
 			return;
 		}
@@ -366,7 +366,7 @@ function connect(){
 					y: bytes_to_datatype(dataview, byteOffset + yData.offset, yData.datatype, littleEndian),
 					z: bytes_to_datatype(dataview, byteOffset + zData.offset, zData.datatype, littleEndian)
 				};
-				const transformed = tf.transformPose(msg.header.frame_id, tf.fixed_frame, point, new Quaternion()).translation;
+				const transformed = tf.transformPoseStamped(msg.header, point, new Quaternion()).translation;
 				pointarray.push(transformed);
 			}
 
@@ -390,7 +390,7 @@ function connect(){
 					y: bytes_to_datatype(dataview, byteOffset + yData.offset, yData.datatype, littleEndian),
 					z: bytes_to_datatype(dataview, byteOffset + zData.offset, zData.datatype, littleEndian)
 				};
-				const transformed = tf.transformPose(msg.header.frame_id, tf.fixed_frame, point, new Quaternion()).translation;
+				const transformed = tf.transformPoseStamped(msg.header, point, new Quaternion()).translation;
 
 				if(rgbData){
 					const bits = dataview.getUint32(byteOffset + rgbData.offset, littleEndian);

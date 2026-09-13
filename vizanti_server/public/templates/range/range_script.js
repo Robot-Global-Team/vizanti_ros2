@@ -199,7 +199,8 @@ function connect(){
 		name : topic,
 		messageType : 'sensor_msgs/msg/Range',
 		compression: rosbridge.compression,
-		throttle_rate: parseInt(throttle.value)
+		throttle_rate: parseInt(throttle.value),
+		queue_length: 1
 	});
 
 	status.setWarn("No data received.");	
@@ -212,7 +213,7 @@ function connect(){
 			error = true;
 		}
 
-		const pose = tf.absoluteTransforms[msg.header.frame_id];
+		const pose = tf.getAbsoluteTransform(msg.header);
 
 		if(!pose){
 			status.setError("Required transform frame \""+msg.header.frame_id+"\" not found.");
