@@ -30,6 +30,16 @@ export class Settings {
 	fromJSON(settings_object) {
 		let storedSettings = JSON.parse(settings_object);
 		Object.assign(this, storedSettings);
+
+		// Older saved and imported layouts may still contain the removed image widget.
+		if (Array.isArray(this.navbar)) {
+			this.navbar = this.navbar.filter(widget => {
+				if (widget.type !== "compressedimage")
+					return true;
+				delete this[widget.id];
+				return false;
+			});
+		}
 	}
 
 	save() {
