@@ -49,6 +49,8 @@ docker run --rm -it --net=host --name vizanti-ros2 -e ROS_DOMAIN_ID=$ROS_DOMAIN_
 
 The web app can be accessed at `http://<host_ip>:5000`. Client settings are automatically saved in localStorage. The satelite imagery renderer also uses the indexedDB to store tiles for offline use (note that this is IP specific). By default the rosbridge instance also occupies port 5001.
 
+The Compressed Image widget has been removed from this branch. Saved and imported layouts omit this widget while preserving the other widgets and their settings.
+
 If you're using a mobile device connected to a robot's hotspot that doesn't have internet access and can't load the page, turn off mobile data. This will prevent the browser from sending packets to the wrong gateway.
 
 ####  Check [the wiki](https://moffkalast.github.io/vizanti_docs) for usage and configuration instructions, as well as feature and compatibility info.

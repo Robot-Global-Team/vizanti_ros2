@@ -213,7 +213,7 @@ let imageToDataURL = utilModule.imageToDataURL;
 The util class provides utility functions, the only one right now being imageToDataURL for persistent image loading that doesn't trigger new server requests upon changing an Image .src param.
 
 ```javascript
-const persistent_image = await imageToDataURL("assets/image.svg");
+const persistent_image = await imageToDataURL("assets/grid.svg");
 ```   
 -----
 ### Status
