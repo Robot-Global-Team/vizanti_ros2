@@ -1,0 +1,22 @@
+# vizanti 포트 방화벽 벨트 - 전용 유닛
+# stock nftables.service 에 묶지 않는 이유: Ubuntu 24.04 의 /etc/nftables.conf 는 `flush ruleset` 을 내장해
+# 재시작 시 ufw(iptables-nft) 체인까지 지우고, 서비스 자체가 기본 비활성이라 재부팅 영속이 보장되지 않음.
+# 설치: install_vizanti_gateway.sh 가 /etc/vizanti-firewall.nft 와 함께 복사 후 enable + reload-or-restart
+#       (이미 active 면 start 는 아무것도 하지 않으므로 ExecReload 로 새 룰을 적용 — Phase 0 <-> 정식 교체 포함)
+[Unit]
+Description=RGT vizanti port guard (nftables: 5000 allow, 5001-5003 loopback only)
+DefaultDependencies=no
+After=local-fs.target nftables.service
+Before=network-pre.target shutdown.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# 룰 파일이 자기 테이블을 delete 후 재생성하므로 재적용이 멱등 (한 트랜잭션: 노출 창 없음)
+ExecStart=/usr/sbin/nft -f /etc/vizanti-firewall.nft
+ExecReload=/usr/sbin/nft -f /etc/vizanti-firewall.nft
+ExecStop=/usr/sbin/nft delete table inet vizanti_guard
+
+[Install]
+WantedBy=sysinit.target

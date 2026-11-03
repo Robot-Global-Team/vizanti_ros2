@@ -2,9 +2,13 @@ import launch
 import launch_ros.actions
 
 def generate_launch_description():
+    #security: same loopback isolation as vizanti_server.launch.py - see comments there.
+    #caution: rws_server has no bind-address parameter, so port 5001 must additionally be
+    #blocked from outside by the firewall ruleset (deploy/firewall-vizanti.nft).
     base_url = launch.substitutions.LaunchConfiguration('base_url', default='') #e.g. /vizanti
-    port = launch.substitutions.LaunchConfiguration('port', default=5000)
+    port = launch.substitutions.LaunchConfiguration('port', default=5002)
     port_rosbridge = launch.substitutions.LaunchConfiguration('port_rosbridge', default=5001)
+    port_public = launch.substitutions.LaunchConfiguration('port_public', default=5000)
     flask_debug = launch.substitutions.LaunchConfiguration('flask_debug', default=False)
     default_widget_config = launch.substitutions.LaunchConfiguration('default_widget_config', default='') #e.g. ~/your_custom_config.json
 
@@ -27,9 +31,9 @@ def generate_launch_description():
         executable='server.py',
         output='screen',
         parameters=[
-            {'host': '0.0.0.0'},
+            {'host': '127.0.0.1'},
             {'port': port},
-            {'port_rosbridge': port_rosbridge},
+            {'port_rosbridge': port_public},
             {'flask_debug': flask_debug},
             {'base_url': base_url},
             {'compression': "cbor"},

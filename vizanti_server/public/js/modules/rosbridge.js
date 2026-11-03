@@ -8,6 +8,8 @@ class Rosbridge {
 	constructor(url) { 
 		this.url = url;
 		this.port = params.port_rosbridge;
+		//page served over https (vizanti gateway TLS) -> browsers block plain ws:// as mixed content
+		this.scheme = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
 		this.compression = params.compression;
 		this.connected = false;
 		this.reconnect_pending = false;
@@ -16,7 +18,7 @@ class Rosbridge {
 		this.status = "Connecting...";
 
 		this.ros = new ROSLIB.Ros({
-			url: 'ws://' + this.url + ':' + this.port
+			url: this.scheme + this.url + ':' + this.port
 		});
 
 		this.ros.on('connection', () => {
@@ -47,7 +49,7 @@ class Rosbridge {
 					return;
 				this.status = "Reconnecting...";
 				window.dispatchEvent(new Event('rosbridge_change'));
-				this.ros.connect('ws://' + this.url + ':' + this.port);
+				this.ros.connect(this.scheme + this.url + ':' + this.port);
 			}, 1000);
 		});
 
@@ -61,7 +63,7 @@ class Rosbridge {
 					this.suspended = false;
 					this.status = "Reconnecting...";
 					window.dispatchEvent(new Event('rosbridge_change'));
-					this.ros.connect('ws://' + this.url + ':' + this.port);
+					this.ros.connect(this.scheme + this.url + ':' + this.port);
 				}
 			}
 		});

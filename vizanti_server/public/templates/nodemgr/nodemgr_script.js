@@ -169,7 +169,9 @@ let currentNode = "";
 killButton.addEventListener('click', async () => {
 	if(await confirm("Do you really want to kill "+currentNode+"?")){
 		console.log("Killing "+currentNode);
-		await killNode(currentNode);
+		let response = await killNode(currentNode);
+		if(!response.success)
+			alert(response.message);
 		closeModal("{uniqueID}_contextmodal");
 		updateNodeList();
 	}

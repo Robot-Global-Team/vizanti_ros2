@@ -1,0 +1,97 @@
+#!/usr/sbin/nft -f
+# RGT 호스트 기본 거부 방화벽 (host guard) — 템플릿. 이 파일을 그대로 적용하지 말 것.
+#
+# 렌더: install_vizanti_gateway.sh 가 @...@ 자리를 채워 /etc/vizanti/firewall-host.nft 로 저장
+#       -> vizanti-host-guard.service 가 적용 (부팅 경로는 렌더 없이 적용만 함)
+# 입력: /etc/vizanti/host-guard.conf  MODE, HW_NETS, HW_NETS_STRICT, EXTRA_TCP_PORTS, EXTRA_UDP_PORTS, TRUST_IFACES
+#       /etc/vizanti/nif.mode         open -> 51231/51233 허용, lock -> 허용 안 함
+#                                     (lock 에서는 EXTRA_TCP_PORTS 로도 51231/51233 을 열 수 없음 — 렌더러가 거부)
+# 설정을 바꾼 뒤: sudo bash install_vizanti_gateway.sh host-guard reload
+# 미리보기(root 불필요): bash install_vizanti_gateway.sh host-guard render
+#
+# 모드
+#   observe  policy accept. 허용 목록 밖의 패킷도 통과시키되 "rgt-guard " 로 기록한다
+#            (출발지·프로토콜·목적 포트 조합당 10분에 1줄) -> enforce 로 바꿨을 때 끊길 것을 미리 조사
+#   enforce  policy drop. 허용 목록 밖은 버리고 "rgt-guard-drop " 으로 기록 (같은 중복 억제)
+#   nif.mode=open 인 동안 51231/51233 새 연결의 출발지는 모드와 무관하게 "rgt-nif " 로 기록 (호출자 조사용)
+#   로그 확인: journalctl _TRANSPORT=kernel | grep rgt-   (-k 는 현재 부팅만)  /  집계: install_vizanti_gateway.sh host-guard survey
+#
+# vizanti_guard(firewall-vizanti.nft, priority -10) 와의 공존
+#   같은 훅에 걸린 base chain 은 테이블마다 모두 평가된다. accept 는 "그 체인"의 평가만 끝내고 다음
+#   우선순위 체인으로 넘어가며, drop 만 최종 판정이다. vizanti_guard 의 5000 accept 는 이 테이블을
+#   건너뛰게 하지 않으므로 22/5000 등은 여기서 다시 accept 해야 한다. 반대로 이 테이블의 accept 도
+#   vizanti_guard 의 drop(5000 연결 상한·5001-5003 차단)을 무르지 못한다 (그쪽이 -10 으로 먼저 평가됨).
+#   ufw 가 활성인 로봇은 ufw(iptables-nft) 체인도 따로 평가된다 (이 테이블이 ufw 를 대체하지 않음).
+#
+# 멱등: 아래 table/delete 두 줄이 자기 테이블을 지우고 다시 만든다 (nft -f 한 번 = 한 트랜잭션, 무방비 구간 없음).
+
+@RENDER_INFO@
+
+@DEFINES@
+
+table inet rgt_host_guard
+delete table inet rgt_host_guard
+
+table inet rgt_host_guard {
+    # 로그 중복 억제: (출발지 . L4 프로토콜 . 목적 포트) 를 10분간 기억한다.
+    # 가득 차면 기록만 생략되고 판정에는 영향이 없다 (기록 규칙은 판정을 내리지 않음).
+    set seen4 { type ipv4_addr . inet_proto . inet_service; flags dynamic, timeout; timeout 10m; size 8192; }
+    set seen6 { type ipv6_addr . inet_proto . inet_service; flags dynamic, timeout; timeout 10m; size 8192; }
+    # rgt-nif 전용 (출발지 . 목적 포트): 다른 포트 스캔으로 seen4/6 이 차도 51231/51233 호출자는 계속 기록
+    set seen_nif4 { type ipv4_addr . inet_service; flags dynamic, timeout; timeout 10m; size 8192; }
+    set seen_nif6 { type ipv6_addr . inet_service; flags dynamic, timeout; timeout 10m; size 8192; }
+    # rgt-guard 출발지별 기록 예산 (출발지마다 초당 1줄, 순간 20줄, 10분마다 초기화). 새 출발지는 초당 20개까지만 들어오고,
+    # 가득 차면 새 출발지는 기록되지 않음 (판정 무관)
+    set glog_src4 { type ipv4_addr; flags dynamic, timeout; timeout 10m; size 8192; }
+    set glog_src6 { type ipv6_addr; flags dynamic, timeout; timeout 10m; size 8192; }
+
+    chain input {
+        type filter hook input priority 0; policy @POLICY@;
+
+        # 루프백은 conntrack 판정보다 먼저 무조건 허용 (게이트웨이 스플라이스, rosbridge, 로컬 DDS)
+        iif "lo" accept
+        ct state established,related accept
+        ct state invalid drop
+        # 로봇이 스스로 보낸 멀티캐스트/브로드캐스트의 루프백 사본 (ROS 2 DDS 로컬 디스커버리 등).
+        # 커널은 이 사본을 lo 가 아니라 "송신한 NIC" 로 수신 처리하고(iif lo 아님, ct state new),
+        # nft 의 meta pkttype 도 PACKET_LOOPBACK 을 multicast/broadcast 로 보여 주므로 "출발지가 내 주소"로 식별한다.
+        # IPv4 한정: 밖에서 들어온 패킷이 내 주소를 출발지로 위조하면 커널이 라우팅 단계에서 martian 으로 버린다
+        # (accept_local=0 기본). IPv6 에는 그런 검사가 없어 위조를 막을 수 없으므로 열지 않는다
+        # (ROS 2 기본 DDS(Fast DDS/Cyclone)는 IPv4 — IPv6 DDS 를 쓰는 로봇은 observe 로그로 먼저 확인).
+        meta nfproto ipv4 meta pkttype { broadcast, multicast } fib saddr type local accept comment "looped-back local multicast/broadcast (IPv4)"
+
+        # ICMP / ICMPv6 필수 (오류 통지는 대부분 ct related 로도 통과하지만 명시)
+        icmp type { echo-request, destination-unreachable, time-exceeded, parameter-problem } accept
+        ip protocol igmp accept
+        icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem, echo-request,
+                      nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert,
+                      mld-listener-query, mld-listener-report, mld-listener-done, mld2-listener-report } accept
+
+        # DHCP 응답 (서버 -> 클라이언트). 브로드캐스트 응답은 conntrack 상 new 로 보이므로 따로 허용
+        udp sport 67 udp dport 68 accept comment "DHCPv4"
+        udp sport 547 udp dport 546 accept comment "DHCPv6"
+
+        # vizanti 백엔드 5001-5003 은 루프백 전용 — vizanti_guard 와 이중화. 모든 허용 규칙보다 앞에 두어
+        # observe 모드에서도, HW_NETS·TRUST_IFACES 출발지도 막는다 (lo 는 맨 위에서 이미 허용)
+        tcp dport 5001-5003 drop comment "vizanti backends: loopback only"
+
+        # 로봇 하드웨어망 (MCU UDP 링크, LiDAR) — host-guard.conf HW_NETS.
+        #   HW_NETS_STRICT=no : 렌더 시점에 그 대역 주소를 가진 직접 연결 NIC 에 iifname 으로 고정 (다른 NIC 로 온 위조 출발지 불허)
+        #   HW_NETS_STRICT=yes: 패킷마다 fib 경로 검사, 렌더 시점 기본 경로 NIC 는 제외. HW 대역의 직접 경로가 없으면
+        #                       그 출발지로 가는 다른 경로(VPN 등)의 NIC 로 들어온 위조가 통과
+        @HW_NET_RULES@
+
+        # 관리 / 게이트웨이 (5000 의 연결수·속도 제한은 vizanti_guard 가 priority -10 에서 이미 적용)
+        tcp dport 22 accept comment "ssh"
+        tcp dport 5000 accept comment "vizanti gateway (TLS)"
+
+        # network-iface 51231(API) / 51233(package) — nif.mode=open 일 때만 허용
+        @NIF_RULES@
+
+        # host-guard.conf EXTRA_TCP_PORTS / EXTRA_UDP_PORTS / TRUST_IFACES
+        @EXTRA_RULES@
+
+        # 최종 판정 — 여기까지 온 패킷은 허용 목록 밖 (외부 DDS UDP 7400+, ROS 마스터 11311, 기타 서비스)
+        @FINAL_RULES@
+    }
+}

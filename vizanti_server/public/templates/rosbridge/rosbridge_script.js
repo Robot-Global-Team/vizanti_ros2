@@ -26,7 +26,7 @@ let img_connect = await imageToDataURL('assets/rosbridge_connected.svg');
 let img_disconnect = await imageToDataURL('assets/rosbridge_disconnected.svg');
 
 function update_gui(){
-	url.innerText = "Bridge URL: ws://"+rosbridge.url + ":"+rosbridge.port;
+	url.innerText = "Bridge URL: "+rosbridge.scheme+rosbridge.url + ":"+rosbridge.port;
 	compression.innerText = "Topic compression type: "+rosbridge.compression;
 
 	switch (rosbridge.status) {

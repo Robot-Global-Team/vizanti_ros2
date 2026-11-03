@@ -1,0 +1,26 @@
+# RGT 호스트 기본 거부 방화벽 (host guard) - 전용 유닛
+# 적용 대상: /etc/vizanti/firewall-host.nft (table inet rgt_host_guard, input priority 0)
+#   이 파일은 install_vizanti_gateway.sh 가 deploy/firewall-host.nft.in + /etc/vizanti/host-guard.conf
+#   + /etc/vizanti/nif.mode 로 렌더해 둔 결과물. 부팅 경로에서는 렌더하지 않고 적용만 한다
+#   (HW_NETS 의 하드웨어 NIC 이름(STRICT=no)과 기본 경로 NIC 제외(STRICT=yes)도 렌더 시점 값 — 바뀌면
+#    host-guard reload. host-guard status 가 커널 룰과 지금 경로를 비교해 경고).
+# stock nftables.service 에 묶지 않는 이유는 vizanti-firewall.service 와 같음 (flush ruleset 내장, 기본 비활성).
+# 설치/모드 전환: install_vizanti_gateway.sh host-guard observe|enforce|off
+[Unit]
+Description=RGT host guard (nftables default-deny input, observe/enforce)
+DefaultDependencies=no
+After=local-fs.target nftables.service vizanti-firewall.service
+Before=network-pre.target shutdown.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# 룰 파일이 자기 테이블을 delete 후 재생성하므로 재적용이 멱등 (한 트랜잭션: 노출 창 없음)
+ExecStart=/usr/sbin/nft -f /etc/vizanti/firewall-host.nft
+ExecReload=/usr/sbin/nft -f /etc/vizanti/firewall-host.nft
+# 테이블이 이미 없어도(수동 삭제·nftables.service flush) 정지는 성공으로 처리
+ExecStop=-/usr/sbin/nft delete table inet rgt_host_guard
+
+[Install]
+WantedBy=sysinit.target

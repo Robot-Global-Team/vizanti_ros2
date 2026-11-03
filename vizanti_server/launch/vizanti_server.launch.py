@@ -4,9 +4,14 @@ import launch_ros.actions
 def generate_launch_description():
 
     #general params
+    #security: flask/rosbridge are loopback-only backends; the only externally
+    #exposed port is the authenticating gateway (vizanti_gateway.py) on port_public.
+    #Dev mode without the gateway: port_public:=5001 and open http://127.0.0.1:5002
+    #rosbridge stays on 5001 (loopback): the on-board GUI hardcodes ws://localhost:5001 (rgt_ros2_gui useRosbridge.ts)
     base_url = launch.substitutions.LaunchConfiguration('base_url', default='') #e.g. /vizanti
-    port = launch.substitutions.LaunchConfiguration('port', default=5000)
-    port_rosbridge = launch.substitutions.LaunchConfiguration('port_rosbridge', default=5001)
+    port = launch.substitutions.LaunchConfiguration('port', default=5002) #flask backend (127.0.0.1)
+    port_rosbridge = launch.substitutions.LaunchConfiguration('port_rosbridge', default=5001) #rosbridge backend (127.0.0.1)
+    port_public = launch.substitutions.LaunchConfiguration('port_public', default=5000) #gateway port the browser connects to
     flask_debug = launch.substitutions.LaunchConfiguration('flask_debug', default=False)
     default_widget_config = launch.substitutions.LaunchConfiguration('default_widget_config', default='') #e.g. ~/your_custom_config.json
 
@@ -27,9 +32,9 @@ def generate_launch_description():
         executable='rosbridge_websocket',
         output='screen',
         parameters=[
-            {'authenticate': False},
+            #note: rosbridge 2.x (ROS 2) ignores 'authenticate' - auth is done by vizanti_gateway.py in front
             {'port': port_rosbridge},
-            {'address': '0.0.0.0'},
+            {'address': '127.0.0.1'},
             {'retry_startup_delay': retry_startup_delay},
             {'fragment_timeout': fragment_timeout},
             {'delay_between_messages': delay_between_messages},
@@ -55,9 +60,9 @@ def generate_launch_description():
         executable='server.py',
         output='screen',
         parameters=[
-            {'host': '0.0.0.0'},
+            {'host': '127.0.0.1'},
             {'port': port},
-            {'port_rosbridge': port_rosbridge},
+            {'port_rosbridge': port_public}, #what the browser is told to open - the gateway splices ws to port_rosbridge
             {'flask_debug': flask_debug},
             {'base_url': base_url},
             {'compression': "none"},

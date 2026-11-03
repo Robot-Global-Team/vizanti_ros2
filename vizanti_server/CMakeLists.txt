@@ -25,6 +25,7 @@ find_package(rosbridge_suite REQUIRED)
 install(DIRECTORY
   launch
   public
+  deploy
   DESTINATION share/${PROJECT_NAME}/
 )
 
@@ -33,6 +34,7 @@ install(PROGRAMS
   scripts/server.py
   scripts/service_handler.py
   scripts/rqt_reconfigure_param_api.py
+  scripts/vizanti_gateway.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
