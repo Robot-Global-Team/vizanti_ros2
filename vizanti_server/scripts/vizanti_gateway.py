@@ -7,6 +7,12 @@ The gateway checks every protected request there and forwards NIF bearer tokens
 to the protected REST/package backends. A missing authority fails closed (503).
 Legacy clients.json/newcode behavior below is available only with --auth-mode legacy.
 
+Code-only enrollment (1.5.0+): pyOpenSSL MemoryBIO TLS exposes the actual TLS 1.3
+exporter. /gw/enroll/start -> confirm -> commit are the only keep-alive routes,
+on one connection, at most three requests. NIF owns PAKE state and registration.
+No TLS exporter or connection identity is accepted from HTTP JSON/headers.
+The legacy access model described below is retained for explicit legacy mode.
+
 The only externally exposed vizanti port. Everything behind it is loopback:
   flask (server.py)       127.0.0.1:5002
   rosbridge / rws         127.0.0.1:5001   (5001 is also a contract with the on-board
@@ -62,7 +68,9 @@ Portability: one file serves both the ROS 2 (3.4.0, Ubuntu 24.04, Python 3.12) a
 the ROS 1 (2.9.x, Ubuntu 18.04, Python 3.6) robots. It therefore uses only asyncio
 APIs that exist since Python 3.6 (own accept loop + connect_accepted_socket for TLS)
 and verifies Ed25519 with the first available backend: python3-cryptography (>=2.6)
--> PyNaCl -> a built-in pure-Python RFC 8032 verifier. No other dependencies, no ROS,
+-> PyNaCl -> a built-in pure-Python RFC 8032 verifier. pyOpenSSL is required for
+code-only enrollment; without it existing certificate-pinned logins remain usable
+and new code-only registration is unavailable. No ROS dependency,
 so it runs as an independent systemd unit (deploy/vizanti-gateway.service) and keeps
 serving its guidance page even when the nav stack / vizanti itself is down.
 """
@@ -89,7 +97,23 @@ import urllib.parse
 import uuid
 from http.client import responses as HTTP_REASONS
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
+ENROLLMENT_PROTOCOL = "spake2-tls-exporter-v2"
+ENROLLMENT_TIMEOUT_S = 60.0
+TLS_EXPORTER_LABEL = b"EXPORTER-Channel-Binding"
+
+try:
+    from OpenSSL import SSL as OPENSSL_SSL
+except ImportError:
+    OPENSSL_SSL = None
+
+
+def openssl_exporter_available():
+    return (OPENSSL_SSL is not None and
+            hasattr(OPENSSL_SSL.Connection, "export_keying_material") and
+            hasattr(OPENSSL_SSL.Context, "set_min_proto_version") and
+            hasattr(OPENSSL_SSL, "TLS_SERVER_METHOD") and
+            hasattr(OPENSSL_SSL, "TLS1_3_VERSION"))
 SIGN_CONTEXT = b"vizanti-gw-v2"          # session signature: SIGN_CONTEXT|fp|client_id|nonce
 API_SIGN_CONTEXT = b"rgt-robot-api-v1"   # API token signature: API_SIGN_CONTEXT|fp|client_id|nonce
 PAIR_PROOF_CONTEXT = b"vizanti-gw-pair-v1"  # pairing proof: HMAC(code, CTX|fp|pubkey|name)
@@ -761,6 +785,203 @@ def now() -> float:
     return time.monotonic()
 
 
+class OpenSSLBIOTransport(asyncio.Transport, asyncio.Protocol):
+    """TLS over a bounded asyncio TCP transport, using public pyOpenSSL APIs.
+
+    The application sees a normal StreamReader/StreamWriter. TCP write pressure
+    and StreamReader read pressure propagate through this layer; no second read
+    task or unbounded plaintext queue is introduced. TLS objects never escape
+    the owning event loop. The handshake future is separately deadline bounded.
+    """
+    MAX_PENDING = 1024 * 1024
+
+    def __init__(self, context, application, loop):
+        super().__init__()
+        self.application = application
+        self.loop = loop
+        self.raw = None
+        self.tls = OPENSSL_SSL.Connection(context, None)
+        self.tls.set_accept_state()
+        self.ready = loop.create_future()
+        self.handshaken = False
+        self.closed = False
+        self.pending = bytearray()
+        self.write_paused = False
+        self.raw_write_paused = False
+        self.failure = None
+
+    def connection_made(self, transport):
+        self.raw = transport
+        self._pump()
+
+    def _flush_ciphertext(self):
+        while True:
+            try:
+                data = self.tls.bio_read(65536)
+            except OPENSSL_SSL.WantReadError:
+                return
+            if not data:
+                return
+            self.raw.write(data)
+
+    def _pump(self):
+        if self.closed:
+            return
+        try:
+            if not self.handshaken:
+                try:
+                    self.tls.do_handshake()
+                except (OPENSSL_SSL.WantReadError, OPENSSL_SSL.WantWriteError):
+                    self._flush_ciphertext()
+                    return
+                self.handshaken = True
+                self.application.connection_made(self)
+                self._update_pressure()
+                if not self.ready.done():
+                    self.ready.set_result(self)
+            while self.pending:
+                try:
+                    sent = self.tls.send(bytes(self.pending[:65536]))
+                    del self.pending[:sent]
+                    self._flush_ciphertext()
+                except (OPENSSL_SSL.WantReadError, OPENSSL_SSL.WantWriteError):
+                    break
+            self._flush_ciphertext()
+            self._update_pressure()
+            while True:
+                try:
+                    data = self.tls.recv(65536)
+                except (OPENSSL_SSL.WantReadError, OPENSSL_SSL.WantWriteError):
+                    break
+                except OPENSSL_SSL.ZeroReturnError:
+                    self.close()
+                    break
+                if not data:
+                    break
+                self.application.data_received(data)
+                # StreamReader may have paused TCP at its high water mark.
+                if not self.raw.is_reading():
+                    break
+            self._flush_ciphertext()
+        except OPENSSL_SSL.Error:
+            self._failed(ConnectionError("TLS connection failed"))
+        except Exception as exc:
+            self._failed(exc)
+
+    def data_received(self, data):
+        try:
+            self.tls.bio_write(data)
+        except OPENSSL_SSL.Error:
+            self._failed(ConnectionError("TLS input failed"))
+            return
+        self._pump()
+
+    def eof_received(self):
+        # A TCP EOF without close_notify is not authenticated TLS EOF.
+        self._failed(ConnectionError("TLS peer disconnected"))
+        return False
+
+    def connection_lost(self, exc):
+        self.closed = True
+        if not self.ready.done():
+            self.ready.set_exception(exc or ConnectionError("TLS handshake closed"))
+        if self.handshaken:
+            self.application.connection_lost(exc or self.failure)
+
+    def _failed(self, exc):
+        if not self.ready.done():
+            self.ready.set_exception(exc)
+        self.failure = exc
+        self.abort()
+
+    def pause_writing(self):
+        self.raw_write_paused = True
+        self._update_pressure()
+
+    def resume_writing(self):
+        self.raw_write_paused = False
+        self._update_pressure()
+
+    def _update_pressure(self):
+        if not self.handshaken:
+            return
+        blocked = self.raw_write_paused or bool(self.pending)
+        if blocked and not self.write_paused:
+            self.write_paused = True
+            self.application.pause_writing()
+        elif not blocked and self.write_paused:
+            self.write_paused = False
+            self.application.resume_writing()
+
+    def write(self, data):
+        if self.closed:
+            raise ConnectionError("TLS transport closed")
+        if len(self.pending) + len(data) > self.MAX_PENDING:
+            self.abort()
+            raise ConnectionError("TLS output queue exceeded")
+        self.pending.extend(data)
+        self._update_pressure()
+        self._pump()
+
+    def writelines(self, lines):
+        for line in lines:
+            self.write(line)
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            self.tls.shutdown()
+            self._flush_ciphertext()
+        except OPENSSL_SSL.Error:
+            pass
+        self.raw.close()
+
+    def abort(self):
+        self.closed = True
+        self.pending.clear()
+        if self.raw is not None:
+            self.raw.abort()
+
+    def is_closing(self):
+        return self.closed or self.raw.is_closing()
+
+    def pause_reading(self):
+        self.raw.pause_reading()
+
+    def resume_reading(self):
+        self.raw.resume_reading()
+        # SSL may retain decrypted records after StreamReader paused TCP.
+        self.loop.call_soon(self._pump)
+
+    def is_reading(self):
+        return not self.closed and self.raw.is_reading()
+
+    def get_write_buffer_size(self):
+        return len(self.pending) + self.raw.get_write_buffer_size()
+
+    def get_write_buffer_limits(self):
+        return self.raw.get_write_buffer_limits()
+
+    def set_write_buffer_limits(self, high=None, low=None):
+        return self.raw.set_write_buffer_limits(high=high, low=low)
+
+    def can_write_eof(self):
+        return False
+
+    def get_extra_info(self, name, default=None):
+        if name == "ssl_object":
+            return self.tls
+        return self.raw.get_extra_info(name, default)
+
+    def enrollment_binding(self):
+        if not self.handshaken or self.tls.get_protocol_version_name() != "TLSv1.3":
+            raise ValueError("enrollment requires TLS 1.3")
+        # b"" means a PRESENT empty context in pyOpenSSL's supported exporter API.
+        return self.tls.export_keying_material(TLS_EXPORTER_LABEL, 32, b"")
+
+
 class Gateway:
     def __init__(self, args):
         self.args = args
@@ -776,6 +997,7 @@ class Gateway:
         self.key_path = os.path.join(self.data_dir, "tls_key.pem")
         self.cert_fingerprint = None
         self.ssl_ctx = None
+        self.openssl_enabled = False
         self.tls_sem = None     # created inside the running loop (3.6-3.9 bind primitives at creation)
         self._tasks = set()     # strong refs to connection tasks
         self.clients = {}
@@ -852,10 +1074,19 @@ class Gateway:
     @staticmethod
     def auth_status(reply):
         value = reply.get("status", 403)
-        return value if isinstance(value, int) and value in (400, 401, 403, 409, 429, 503) else 403
+        return value if isinstance(value, int) and value in (400, 401, 403, 404, 409, 429, 503) else 403
 
     async def nif_gateway(self, method, path, query, headers, reader, writer, ip, leftover):
         """NIF mode owns *all* registrations, challenges and bearer/UI sessions."""
+        if method == "POST" and path == "/gw/enroll/result":
+            if self.args.no_tls:
+                return self.json_resp(writer, 403, {"error": "tls_required"})
+            body = await self.read_json_body(reader, headers, leftover)
+            fields = {key: body[key] for key in ("request_id", "pubkey", "client_name", "signature") if key in body}
+            reply = await self.nif_auth("enrollment_result", peer_ip=ip, **fields)
+            if not reply["ok"]:
+                return self.json_resp(writer, self.auth_status(reply), {"error": reply.get("error", "enrollment_rejected")})
+            return self.json_resp(writer, 200, dict(ok=True, **{key: reply[key] for key in ("client_id", "perms") if key in reply}))
         if method == "POST" and path in ("/gw/pair", "/gw/challenge", "/gw/api-token", "/gw/session"):
             body = await self.read_json_body(reader, headers, leftover)
             ops = {"/gw/pair": "pair", "/gw/challenge": "challenge",
@@ -1075,10 +1306,10 @@ class Gateway:
     # ---------- small HTTP plumbing ----------
 
     @staticmethod
-    async def read_head(reader):
+    async def read_head(reader, timeout=HEAD_TIMEOUT_S):
         """Read the request head (<=16KB, <=2s). Returns (head_bytes, leftover)."""
         buf = b""
-        deadline = now() + HEAD_TIMEOUT_S
+        deadline = now() + timeout
         while b"\r\n\r\n" not in buf:
             remain = deadline - now()
             if remain <= 0 or len(buf) >= MAX_HEAD_BYTES:
@@ -1109,9 +1340,9 @@ class Gateway:
         return method.upper(), target, headers
 
     @staticmethod
-    def respond(writer, status, body=b"", ctype="application/json; charset=utf-8", extra=()):
+    def respond(writer, status, body=b"", ctype="application/json; charset=utf-8", extra=(), keep_alive=False):
         reasons = {200: "OK", 302: "Found", 400: "Bad Request", 401: "Unauthorized",
-                   403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed",
+                   403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed", 409: "Conflict",
                    408: "Request Timeout", 411: "Length Required", 413: "Payload Too Large",
                    417: "Expectation Failed", 429: "Too Many Requests", 500: "Internal Server Error",
                    502: "Bad Gateway", 503: "Service Unavailable", 504: "Gateway Timeout",
@@ -1121,15 +1352,15 @@ class Gateway:
         head = [f"HTTP/1.1 {status} {reasons.get(status, 'X')}",
                 f"Content-Type: {ctype}",
                 f"Content-Length: {len(body)}",
-                "Connection: close",
+                "Connection: keep-alive" if keep_alive else "Connection: close",
                 "Referrer-Policy: no-referrer",
                 "X-Content-Type-Options: nosniff",
                 "Cache-Control: no-store"]
         head.extend(extra)
         writer.write(("\r\n".join(head) + "\r\n\r\n").encode("latin-1") + body)
 
-    def json_resp(self, writer, status, obj):
-        self.respond(writer, status, json.dumps(obj))
+    def json_resp(self, writer, status, obj, keep_alive=False):
+        self.respond(writer, status, json.dumps(obj), keep_alive=keep_alive)
 
     async def read_json_body(self, reader, headers, leftover):
         try:
@@ -1161,6 +1392,100 @@ class Gateway:
             pass
 
     # ---------- /gw/ endpoints ----------
+
+    async def enrollment_protocols(self):
+        if self.auth_mode != "nif-device-v1" or not self.openssl_enabled:
+            return []
+        reply = await self.nif_auth("enrollment_capabilities")
+        return ([ENROLLMENT_PROTOCOL] if reply.get("ok") and
+                ENROLLMENT_PROTOCOL in reply.get("enrollment_protocols", []) else [])
+
+    async def read_enrollment_body(self, head, reader, leftover, expected_path):
+        """Strict, bounded HTTP/1.1 framing for the only persistent HTTP flow."""
+        if len(head) > MAX_HEAD_BYTES:
+            raise ValueError("enrollment head too large")
+        try:
+            lines = head.decode("ascii").split("\r\n")
+        except UnicodeDecodeError:
+            raise ValueError("invalid enrollment head")
+        if lines[0] != "POST %s HTTP/1.1" % expected_path:
+            raise ValueError("unexpected enrollment step")
+        headers = {}
+        for line in lines[1:]:
+            if not line:
+                continue
+            if line[0].isspace() or ":" not in line:
+                raise ValueError("invalid enrollment header")
+            name, value = line.split(":", 1)
+            if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name):
+                raise ValueError("invalid enrollment header name")
+            name = name.lower()
+            if name in headers:
+                raise ValueError("duplicate enrollment header")
+            headers[name] = value.strip()
+        length = headers.get("content-length", "")
+        if (not re.fullmatch(r"[0-9]{1,5}", length) or "transfer-encoding" in headers
+                or "expect" in headers or "upgrade" in headers or "host" not in headers):
+            raise ValueError("invalid enrollment framing")
+        length = int(length)
+        if not 0 < length <= MAX_BODY_BYTES or len(leftover) > length:
+            raise ValueError("invalid enrollment body size")
+        # Read only this body. A later request can only be the next enrollment
+        # step and can never enter a business route on this connection.
+        body = leftover + await asyncio.wait_for(reader.readexactly(length - len(leftover)), HEAD_TIMEOUT_S)
+        value = json.loads(body.decode("utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError("enrollment body must be an object")
+        return value
+
+    async def handle_enrollment(self, head, leftover, reader, writer, ip):
+        if self.auth_mode != "nif-device-v1" or not isinstance(writer.transport, OpenSSLBIOTransport):
+            return self.json_resp(writer, 503, {"error": "enrollment_unavailable"})
+        try:
+            exporter = writer.transport.enrollment_binding()
+        except ValueError:
+            return self.json_resp(writer, 403, {"error": "tls13_required"})
+        connection = {"connection_id": secrets.token_hex(16),
+                      "tls_exporter": base64.b64encode(exporter).decode("ascii"),
+                      "cert_fingerprint": self.cert_fingerprint, "peer_ip": ip}
+        complete = False
+        try:
+            deadline = now() + ENROLLMENT_TIMEOUT_S
+            steps = (("start", "pake_begin", ("request_id", "pubkey", "client_name"),
+                      ("protocol", "session_id", "generation_id", "auth_instance_id", "perms", "server_message")),
+                     ("confirm", "pake_confirm", ("session_id", "client_message", "proof"), ("proof",)),
+                     ("commit", "pake_commit", ("session_id", "proof", "signature"), ("client_id", "perms")))
+            session_id = None
+            for index, (step, op, allowed, returned) in enumerate(steps):
+                if index:
+                    remaining = deadline - now()
+                    if remaining <= 0:
+                        raise ValueError("enrollment deadline")
+                    head, leftover = await self.read_head(reader, min(remaining, 15.0))
+                body = await self.read_enrollment_body(head, reader, leftover, "/gw/enroll/" + step)
+                if index and body.get("session_id") != session_id:
+                    raise ValueError("enrollment session changed")
+                fields = {key: body[key] for key in allowed if key in body}
+                reply = await self.nif_auth(op, **dict(connection, **fields))
+                if not reply.get("ok"):
+                    self.json_resp(writer, self.auth_status(reply), {"error": reply.get("error", "enrollment_rejected")})
+                    await self.flush_close(writer)
+                    return
+                if not index:
+                    session_id = reply.get("session_id")
+                    if not isinstance(session_id, str) or not session_id:
+                        raise AuthUnavailable("invalid enrollment session")
+                result = {key: reply[key] for key in returned if key in reply}
+                result["ok"] = True
+                self.json_resp(writer, 200, result, keep_alive=index < 2)
+                await writer.drain()
+            complete = True
+        finally:
+            if not complete:
+                try:
+                    await self.nif_auth("pake_abort", **connection)
+                except AuthUnavailable:
+                    pass
 
     def purge_expired(self):
         t = now()
@@ -1198,7 +1523,8 @@ class Gateway:
             return self.json_resp(writer, 200, {
                 "service": "vizanti-gateway", "version": VERSION,
                 "tls": not self.args.no_tls, "cert_fingerprint": self.cert_fingerprint,
-                "api": 1, "api_services": list(API_SERVICES), "auth_mode": self.auth_mode})
+                "api": 1, "api_services": list(API_SERVICES), "auth_mode": self.auth_mode,
+                "enrollment_protocols": await self.enrollment_protocols()})
 
         if self.auth_mode == "nif-device-v1":
             return await self.nif_gateway(method, path, query, headers, reader, writer, ip, leftover)
@@ -1899,7 +2225,17 @@ class Gateway:
         try:
             reader = asyncio.StreamReader()
             protocol = asyncio.StreamReaderProtocol(reader)
-            if self.ssl_ctx is not None:
+            if self.ssl_ctx is not None and self.openssl_enabled:
+                tls = OpenSSLBIOTransport(self.ssl_ctx, protocol, loop)
+                async with self.tls_sem:
+                    await loop.connect_accepted_socket(lambda: tls, sock)
+                    sock = None
+                    try:
+                        transport = await asyncio.wait_for(tls.ready, TLS_HANDSHAKE_TIMEOUT_S)
+                    except BaseException:
+                        tls.abort()
+                        raise
+            elif self.ssl_ctx is not None:
                 kw = {"ssl": self.ssl_ctx}
                 if sys.version_info >= (3, 7):
                     kw["ssl_handshake_timeout"] = TLS_HANDSHAKE_TIMEOUT_S
@@ -1922,6 +2258,11 @@ class Gateway:
             split = urllib.parse.urlsplit(target)
             path = split.path
             query = urllib.parse.parse_qs(split.query)
+
+            if path == "/gw/enroll/start":
+                await self.handle_enrollment(head_bytes, leftover, reader, writer, ip)
+                await self.flush_close(writer)
+                return
 
             if path == "/gw" or path.startswith("/gw/"):
                 try:
@@ -2103,12 +2444,28 @@ class Gateway:
     # ---------- server ----------
 
     def make_ssl_context(self):
+        self.openssl_enabled = False
         if self.args.no_tls:
             log.warning("TLS DISABLED (--no-tls): session cookies and pairing are sniffable on the LAN")
             return None
         if not (os.path.exists(self.cert_path) and os.path.exists(self.key_path)):
             raise SystemExit(f"TLS cert/key missing ({self.cert_path}). Run deploy/install_vizanti_gateway.sh "
                              f"or generate them, or pass --no-tls explicitly.")
+        if openssl_exporter_available():
+            ctx = OPENSSL_SSL.Context(OPENSSL_SSL.TLS_SERVER_METHOD)
+            ctx.set_min_proto_version(OPENSSL_SSL.TLS1_2_VERSION)
+            ctx.set_options(OPENSSL_SSL.OP_NO_COMPRESSION | OPENSSL_SSL.OP_NO_TICKET |
+                            getattr(OPENSSL_SSL, "OP_NO_RENEGOTIATION", 0))
+            ctx.set_session_cache_mode(OPENSSL_SSL.SESS_CACHE_OFF)
+            ctx.use_certificate_chain_file(self.cert_path)
+            ctx.use_privatekey_file(self.key_path)
+            ctx.check_privatekey()
+            self.openssl_enabled = True
+            self.cert_fingerprint = self.load_cert_fingerprint()
+            return ctx
+        # Preserve already enrolled devices if an upgraded installation lacks
+        # the optional bootstrap dependency. Code-only enrollment stays closed.
+        log.warning("pyOpenSSL exporter unavailable: code-only enrollment disabled")
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         if hasattr(ssl, "TLSVersion"):          # Python 3.7+
             ctx.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -2245,6 +2602,8 @@ def cmd_selfcheck(gw: Gateway):
     ok = True
     print(f"python      : {sys.version.split()[0]} ({sys.executable})")
     print(f"openssl     : {ssl.OPENSSL_VERSION}")
+    print("tls exporter: " + ("pyOpenSSL available" if openssl_exporter_available() else
+          "UNAVAILABLE (code-only enrollment disabled)"))
     good = ed25519_verify(_KAT_PUB, _KAT_SIG, b"")
     bad = ed25519_verify(_KAT_PUB, _KAT_SIG[:-1] + bytes([_KAT_SIG[-1] ^ 1]), b"")
     kat = good and not bad

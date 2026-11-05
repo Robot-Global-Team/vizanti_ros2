@@ -13,7 +13,7 @@
 #   sudo bash install_vizanti_gateway.sh ssh-keyonly apply|confirm|revert|status        # ssh-keyonly.sh 에 위임
 #
 # 정식 설치가 하는 일
-#   - 전제 검사: 게이트웨이 바이너리, python3-cryptography, 포트 5000 비점유, 3.4.0 nav launch 적용 여부
+#   - 전제 검사: 게이트웨이 바이너리, python3-cryptography/python3-openssl exporter API, 포트 5000, nav launch
 #   - TLS 자가서명 인증서 생성 (로봇별, 10년) — 최초 등록 전 독립 경로로 지문 확인
 #   - vizanti-firewall.service + vizanti-gateway.service 설치/검증/기동 (재부팅 영속). 재실행(업그레이드·롤백)도
 #     방화벽 룰을 다시 적용하고 게이트웨이를 재시작한 뒤 /gw/info 의 version 이 설치본과 같은지 확인
@@ -1044,6 +1044,12 @@ if ! python3 -c 'import cryptography' 2>/dev/null; then
     echo "[dep] python3-cryptography 설치 시도 (오프라인 로봇이면 미리 deb 를 준비하세요)"
     apt-get install -y python3-cryptography || { echo "오류: python3-cryptography 를 설치할 수 없음" >&2; exit 1; }
 fi
+if ! python3 -c 'from OpenSSL import SSL; assert hasattr(SSL.Connection, "export_keying_material"); assert hasattr(SSL.Context, "set_min_proto_version"); assert SSL.TLS1_3_VERSION' 2>/dev/null; then
+    echo "[dep] python3-openssl 설치 시도 (TLS exporter 기반 접속 코드 등록에 필요)"
+    apt-get install -y python3-openssl || die "python3-openssl 설치 실패 — 운영 서비스는 변경하지 않았습니다"
+fi
+python3 -c 'from OpenSSL import SSL; assert hasattr(SSL.Connection, "export_keying_material"); assert hasattr(SSL.Context, "set_min_proto_version"); assert SSL.TLS1_3_VERSION' \
+    || die "pyOpenSSL TLS 1.3/exporter API 없음 — 설치를 중단합니다"
 
 # A1: 구버전 nav launch 가 떠 있거나 설치돼 있으면 게이트웨이가 5000 을 열 수 없음 -> 중단
 if [[ -n "$(ss -Hltn 'sport = :5000' 2>/dev/null)" ]] && ! systemctl is-active --quiet vizanti-gateway.service; then

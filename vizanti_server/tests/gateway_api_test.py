@@ -1347,8 +1347,8 @@ def run(be, procs):
     print("[1] /gw/info, 비인가 /api")
     r = gw_get("/gw/info")
     info = r.json()
-    check("/gw/info: version 1.4.0, api=1, api_services=[nif,pkg]",
-          info.get("version") == "1.4.0" and info.get("api") == 1 and info.get("api_services") == ["nif", "pkg"], info)
+    check("/gw/info: version 1.5.0, api=1, api_services=[nif,pkg]",
+          info.get("version") == "1.5.0" and info.get("api") == 1 and info.get("api_services") == ["nif", "pkg"], info)
     r = none_reach("토큰 없는 /api -> 401 (백엔드 미접촉)", lambda: api_req("GET", "/api/nif/uid"), 401)
     check("401 에 WWW-Authenticate: Bearer + JSON", r.headers.get("www-authenticate") == "Bearer"
           and r.json() == {"error": "unauthorized"}, r.headers)
