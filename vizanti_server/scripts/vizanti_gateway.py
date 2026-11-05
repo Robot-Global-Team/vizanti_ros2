@@ -97,7 +97,7 @@ import urllib.parse
 import uuid
 from http.client import responses as HTTP_REASONS
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 ENROLLMENT_PROTOCOL = "spake2-tls-exporter-v2"
 ENROLLMENT_TIMEOUT_S = 60.0
 TLS_EXPORTER_LABEL = b"EXPORTER-Channel-Binding"
@@ -238,6 +238,13 @@ _API_STATUS_LINE_RE = re.compile(r"HTTP/1\.[01] ([0-9]{3})(?: (.*))?\Z")
 # headers a request may carry once only (anything framing-, auth- or forwarding-relevant)
 API_SINGLETON_HEADERS = frozenset(("host", "content-length", "transfer-encoding", "authorization",
                                    "content-type", "accept", "origin", "expect"))
+# Repeatable HTTP list fields are combined for routing decisions. Credentials,
+# framing and WebSocket nonces must have exactly one interpretation everywhere.
+HTTP_LIST_HEADERS = frozenset(("accept", "accept-encoding", "accept-language", "cache-control",
+    "connection", "upgrade", "sec-websocket-protocol", "sec-websocket-extensions", "pragma", "via"))
+HTTP_SINGLETON_HEADERS = (API_SINGLETON_HEADERS - {"accept"}) | frozenset((
+    "cookie", "proxy-authorization", "forwarded", "x-forwarded-for", "x-forwarded-host",
+    "x-forwarded-proto", "x-real-ip", "sec-websocket-key", "sec-websocket-version"))
 API_FORWARD_HEADERS = (("content-type", "Content-Type"), ("accept", "Accept"))   # all a client may pass
 API_RESP_DROP_HEADERS = frozenset(("connection", "keep-alive", "transfer-encoding", "content-length",
                                    "set-cookie", "set-cookie2", "server", "cache-control",
@@ -254,6 +261,10 @@ class ApiReject(Exception):
 
 class AuthUnavailable(Exception):
     """The NIF authority cannot safely answer. Never fall back to local registrations."""
+    def __init__(self, detail, error="auth_unavailable", retry_after=1):
+        super().__init__(detail)
+        self.error = error if error in ("auth_busy", "enrollment_capacity_exhausted") else "auth_unavailable"
+        self.retry_after = retry_after if type(retry_after) is int and 1 <= retry_after <= 600 else 1
 
 
 def client_perms(client):
@@ -318,8 +329,10 @@ def parse_api_head(head_bytes):
             raise ApiReject(400, "bad_header")
         name, value = h.group(1).lower(), h.group(2)
         if name in headers:
-            if name in API_SINGLETON_HEADERS:
+            if name in HTTP_SINGLETON_HEADERS:
                 raise ApiReject(400, "duplicate_header")
+            if name in HTTP_LIST_HEADERS:
+                headers[name] += ", " + value
             continue
         headers[name] = value
     if "host" not in headers:
@@ -763,12 +776,11 @@ def _reset_transport(transport):
 
 def _norm_ip(ip):
     # normalize v4-mapped v6 so IP binding matches across the dual-stack socket
-    if ip.startswith("::ffff:"):
-        try:
-            return str(ipaddress.ip_address(ip).ipv4_mapped)
-        except (ValueError, AttributeError):
-            pass
-    return ip
+    try:
+        address = ipaddress.ip_address(ip)
+        return str(getattr(address, "ipv4_mapped", None) or address)
+    except ValueError:
+        return ip
 
 
 class _JournalFormatter(logging.Formatter):
@@ -811,6 +823,11 @@ class OpenSSLBIOTransport(asyncio.Transport, asyncio.Protocol):
         self.failure = None
 
     def connection_made(self, transport):
+        # Cancellation can win before connect_accepted_socket attaches TCP.
+        # A late callback must close its new transport, never revive the TLS flow.
+        if self.closed:
+            transport.abort()
+            return
         self.raw = transport
         self._pump()
 
@@ -869,6 +886,8 @@ class OpenSSLBIOTransport(asyncio.Transport, asyncio.Protocol):
             self._failed(exc)
 
     def data_received(self, data):
+        if self.closed:
+            return
         try:
             self.tls.bio_write(data)
         except OPENSSL_SSL.Error:
@@ -936,16 +955,19 @@ class OpenSSLBIOTransport(asyncio.Transport, asyncio.Protocol):
             self._flush_ciphertext()
         except OPENSSL_SSL.Error:
             pass
-        self.raw.close()
+        if self.raw is not None:
+            self.raw.close()
 
     def abort(self):
         self.closed = True
         self.pending.clear()
+        if not self.ready.done():
+            self.ready.cancel()
         if self.raw is not None:
             self.raw.abort()
 
     def is_closing(self):
-        return self.closed or self.raw.is_closing()
+        return self.closed or (self.raw is not None and self.raw.is_closing())
 
     def pause_reading(self):
         self.raw.pause_reading()
@@ -980,6 +1002,69 @@ class OpenSSLBIOTransport(asyncio.Transport, asyncio.Protocol):
             raise ValueError("enrollment requires TLS 1.3")
         # b"" means a PRESENT empty context in pyOpenSSL's supported exporter API.
         return self.tls.export_keying_material(TLS_EXPORTER_LABEL, 32, b"")
+
+
+class AcceptedSocketProtocol(asyncio.Protocol):
+    """Own a transport even if its connection callback arrives after cancellation.
+
+    The public asyncio attachment coroutine may be pending before a transport
+    exists. Closing only the original socket misses that ownership transition.
+    This guard also consumes the attachment task's eventual result/exception.
+    """
+    def __init__(self, application):
+        self.application = application
+        self.transport = None
+        self.aborted_transport = None
+        self.closed = False
+        self.attached = False
+
+    def connection_made(self, transport):
+        self.transport = transport
+        if self.closed:
+            self._abort_transport(transport)
+            return
+        self.attached = True
+        self.application.connection_made(transport)
+
+    def attachment_done(self, task):
+        if task.cancelled():
+            return
+        try:
+            transport, _ = task.result()
+        except Exception:
+            return
+        if self.closed:
+            self._abort_transport(transport)
+
+    def _abort_transport(self, transport):
+        if transport is not self.aborted_transport:
+            self.aborted_transport = transport
+            transport.abort()
+
+    def abort(self):
+        self.closed = True
+        if self.transport is not None:
+            self._abort_transport(self.transport)
+
+    def data_received(self, data):
+        if not self.closed:
+            self.application.data_received(data)
+
+    def eof_received(self):
+        return self.application.eof_received() if self.attached and not self.closed else False
+
+    def connection_lost(self, exc):
+        self.closed = True
+        if self.attached:
+            self.application.connection_lost(exc)
+
+    def pause_writing(self):
+        if self.attached and not self.closed:
+            self.application.pause_writing()
+
+    def resume_writing(self):
+        if self.attached and not self.closed:
+            self.application.resume_writing()
 
 
 class Gateway:
@@ -1063,7 +1148,7 @@ class Gateway:
                 self.sever(lambda c: True, "authority_restart")
             self.nif_instance = instance
             if not reply["ok"] and reply.get("status") == 503:
-                raise AuthUnavailable("authority rejected service state")
+                raise AuthUnavailable("authority rejected service state", reply.get("error"), reply.get("retry_after"))
             return reply
         except (OSError, ValueError, asyncio.TimeoutError, asyncio.IncompleteReadError) as e:
             raise AuthUnavailable(type(e).__name__)
@@ -1076,6 +1161,17 @@ class Gateway:
         value = reply.get("status", 403)
         return value if isinstance(value, int) and value in (400, 401, 403, 404, 409, 429, 503) else 403
 
+    def auth_reject(self, writer, reply, default="auth_failed"):
+        """Forward only stable public error/rate information, never authority state."""
+        status = self.auth_status(reply)
+        value = {"error": reply.get("error", default)}
+        extra = []
+        retry = reply.get("retry_after")
+        if status in (429, 503) and type(retry) is int and 1 <= retry <= 600:
+            value["retry_after_seconds"] = retry
+            extra.append("Retry-After: %d" % retry)
+        self.json_resp(writer, status, value, extra=extra)
+
     async def nif_gateway(self, method, path, query, headers, reader, writer, ip, leftover):
         """NIF mode owns *all* registrations, challenges and bearer/UI sessions."""
         if method == "POST" and path == "/gw/enroll/result":
@@ -1085,7 +1181,7 @@ class Gateway:
             fields = {key: body[key] for key in ("request_id", "pubkey", "client_name", "signature") if key in body}
             reply = await self.nif_auth("enrollment_result", peer_ip=ip, **fields)
             if not reply["ok"]:
-                return self.json_resp(writer, self.auth_status(reply), {"error": reply.get("error", "enrollment_rejected")})
+                return self.auth_reject(writer, reply, "enrollment_rejected")
             return self.json_resp(writer, 200, dict(ok=True, **{key: reply[key] for key in ("client_id", "perms") if key in reply}))
         if method == "POST" and path in ("/gw/pair", "/gw/challenge", "/gw/api-token", "/gw/session"):
             body = await self.read_json_body(reader, headers, leftover)
@@ -1097,7 +1193,7 @@ class Gateway:
                 fields["name"] = body.get("client_name", "")
             reply = await self.nif_auth(ops[path], peer_ip=ip, **fields)
             if not reply["ok"]:
-                return self.json_resp(writer, self.auth_status(reply), {"error": reply.get("error", "auth_failed")})
+                return self.auth_reject(writer, reply)
             if path == "/gw/session":
                 if not isinstance(reply.get("token"), str) or "ui" not in reply.get("perms", []):
                     raise AuthUnavailable("invalid authority UI session")
@@ -1319,25 +1415,57 @@ class Gateway:
                 raise ValueError("closed before head")
             buf += chunk
         head, _, leftover = buf.partition(b"\r\n\r\n")
-        return head + b"\r\n\r\n", leftover
+        head += b"\r\n\r\n"
+        if len(head) > MAX_HEAD_BYTES:
+            raise ValueError("head too large")
+        return head, leftover
 
     @staticmethod
     def parse_head(head_bytes):
-        text = head_bytes.decode("latin-1")
-        lines = text.split("\r\n")
-        try:
-            method, target, _version = lines[0].split(" ", 2)
-        except ValueError:
-            raise ValueError("bad request line")
-        if not target.startswith("/") or target.startswith("//"):   # origin-form only
-            raise ValueError("bad target")
+        """Common HTTP/1.1 syntax and framing gate, before any route/auth RPC."""
+        if (len(head_bytes) > MAX_HEAD_BYTES or not head_bytes.endswith(b"\r\n\r\n")
+                or _API_BAD_REQ_BYTES_RE.search(head_bytes)):
+            raise ApiReject(400, "bad_request")
+        lines = head_bytes[:-4].decode("ascii").split("\r\n")
+        if any("\r" in line or "\n" in line for line in lines):
+            raise ApiReject(400, "bad_request")
+        request = _API_REQUEST_LINE_RE.fullmatch(lines[0])
+        if not request:
+            raise ApiReject(400, "bad_request")
+        method, target = request.groups()
+        if (not target.startswith("/") or target.startswith("//") or "#" in target
+                or "\\" in target or _API_BAD_PCT_RE.search(target)):
+            raise ApiReject(400, "bad_target")
+        if len(lines) - 1 > API_MAX_HEADERS:
+            raise ApiReject(400, "too_many_headers")
         headers = {}
         for line in lines[1:]:
-            if not line or ":" not in line:
+            header = _API_HEADER_RE.fullmatch(line)
+            if not header or line.startswith((" ", "\t")):
+                raise ApiReject(400, "bad_header")
+            name, value = header.group(1).lower(), header.group(2)
+            if name in headers:
+                if name in HTTP_SINGLETON_HEADERS:
+                    raise ApiReject(400, "duplicate_header")
+                if name in HTTP_LIST_HEADERS:
+                    headers[name] += ", " + value
                 continue
-            k, v = line.split(":", 1)
-            headers[k.strip().lower()] = v.strip()
-        return method.upper(), target, headers
+            headers[name] = value
+        host = headers.get("host", "")
+        if not re.fullmatch(r"(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._~-]+)(?::[0-9]{1,5})?", host):
+            raise ApiReject(400, "bad_host")
+        try:
+            authority = urllib.parse.urlsplit("//" + host)
+            authority.port  # also rejects out-of-range ports
+            if host.startswith("["):
+                ipaddress.IPv6Address(authority.hostname)
+        except ValueError:
+            raise ApiReject(400, "bad_host")
+        if "transfer-encoding" in headers:
+            raise ApiReject(411, "length_required")
+        if "content-length" in headers and not _API_DIGITS_RE.fullmatch(headers["content-length"]):
+            raise ApiReject(400, "bad_content_length")
+        return method, target, headers
 
     @staticmethod
     def respond(writer, status, body=b"", ctype="application/json; charset=utf-8", extra=(), keep_alive=False):
@@ -1359,8 +1487,8 @@ class Gateway:
         head.extend(extra)
         writer.write(("\r\n".join(head) + "\r\n\r\n").encode("latin-1") + body)
 
-    def json_resp(self, writer, status, obj, keep_alive=False):
-        self.respond(writer, status, json.dumps(obj), keep_alive=keep_alive)
+    def json_resp(self, writer, status, obj, keep_alive=False, extra=()):
+        self.respond(writer, status, json.dumps(obj), keep_alive=keep_alive, extra=extra)
 
     async def read_json_body(self, reader, headers, leftover):
         try:
@@ -1402,27 +1530,9 @@ class Gateway:
 
     async def read_enrollment_body(self, head, reader, leftover, expected_path):
         """Strict, bounded HTTP/1.1 framing for the only persistent HTTP flow."""
-        if len(head) > MAX_HEAD_BYTES:
-            raise ValueError("enrollment head too large")
-        try:
-            lines = head.decode("ascii").split("\r\n")
-        except UnicodeDecodeError:
-            raise ValueError("invalid enrollment head")
-        if lines[0] != "POST %s HTTP/1.1" % expected_path:
+        method, target, headers = self.parse_head(head)
+        if method != "POST" or target != expected_path:
             raise ValueError("unexpected enrollment step")
-        headers = {}
-        for line in lines[1:]:
-            if not line:
-                continue
-            if line[0].isspace() or ":" not in line:
-                raise ValueError("invalid enrollment header")
-            name, value = line.split(":", 1)
-            if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name):
-                raise ValueError("invalid enrollment header name")
-            name = name.lower()
-            if name in headers:
-                raise ValueError("duplicate enrollment header")
-            headers[name] = value.strip()
         length = headers.get("content-length", "")
         if (not re.fullmatch(r"[0-9]{1,5}", length) or "transfer-encoding" in headers
                 or "expect" in headers or "upgrade" in headers or "host" not in headers):
@@ -1468,7 +1578,7 @@ class Gateway:
                 fields = {key: body[key] for key in allowed if key in body}
                 reply = await self.nif_auth(op, **dict(connection, **fields))
                 if not reply.get("ok"):
-                    self.json_resp(writer, self.auth_status(reply), {"error": reply.get("error", "enrollment_rejected")})
+                    self.auth_reject(writer, reply, "enrollment_rejected")
                     await self.flush_close(writer)
                     return
                 if not index:
@@ -1728,27 +1838,12 @@ class Gateway:
         Any pipelined bytes are discarded. Only WebSocket upgrades retain bidirectional splicing.
         This prevents a later HTTP request from sharing the first request's authorization check.
         """
-        lines = head_bytes[:-4].split(b"\r\n")
         try:
-            if _API_BAD_REQ_BYTES_RE.search(head_bytes):
-                raise ValueError()
-            match = _API_REQUEST_LINE_RE.fullmatch(lines[0].decode("ascii"))
-            if not match:
-                raise ValueError()
-            method, target = match.groups()
-            parsed = {}
-            for raw in lines[1:]:
-                field = _API_HEADER_RE.fullmatch(raw.decode("ascii"))
-                if not field or raw.startswith((b" ", b"\t")):
-                    raise ValueError()
-                name, value = field.group(1).lower(), field.group(2)
-                if name in parsed and name in API_SINGLETON_HEADERS | {"cookie"}:
-                    raise ValueError()
-                parsed[name] = value
+            method, target, parsed = self.parse_head(head_bytes)
             if ("host" not in parsed or "transfer-encoding" in parsed
                     or ("content-length" in parsed and parsed["content-length"] != "0")):
                 raise ValueError()
-        except (ValueError, UnicodeError):
+        except (ApiReject, ValueError, UnicodeError):
             return self.json_resp(writer, 400, {"error": "bad_request"})
         if method not in ("GET", "HEAD"):
             return self.respond(writer, 405, b"", "text/plain", extra=["Allow: GET, HEAD"])
@@ -1848,7 +1943,7 @@ class Gateway:
 
     @staticmethod
     def is_api_request(head_bytes):
-        """Routing on the raw request target, ahead of the lenient UI parser and the cookie
+        """Routing on the raw request target after common syntax checks, ahead of the cookie
         session: everything under /api belongs to the robot API (cookies never apply there)."""
         parts = head_bytes.split(b"\r\n", 1)[0].split(b" ")
         if len(parts) < 2:
@@ -1931,8 +2026,9 @@ class Gateway:
             return await self.api_reject(writer, reader, leftover, headers, length, 403, "forbidden")
         try:
             client_id, perms = await self.authorize_api(headers.get("authorization"), ip)
-        except AuthUnavailable:
-            return await self.api_reject(writer, reader, leftover, headers, length, 503, "auth_unavailable")
+        except AuthUnavailable as exc:
+            return await self.api_reject(writer, reader, leftover, headers, length, 503, exc.error,
+                                         extra=["Retry-After: %d" % exc.retry_after])
         if client_id is None:
             self._warn("api-unauth", ip, "api unauthenticated request ip=%s %s %s %s",
                        ip, method, svc, path[:80])
@@ -2202,6 +2298,7 @@ class Gateway:
         while True:
             try:
                 sock, addr = await loop.sock_accept(lsock)
+                accepted_at = now()
             except OSError as e:   # EMFILE/ENFILE etc.: back off instead of spinning
                 self._warn("accept", "-", "accept failed: %s", e)
                 await asyncio.sleep(0.5)
@@ -2216,45 +2313,91 @@ class Gateway:
             sock.setblocking(False)
             self.live_total += 1
             self.per_ip[ip] = self.per_ip.get(ip, 0) + 1
-            self._spawn(self.handle_socket(sock, ip))
+            # The five-second TLS allowance starts at accept, before task/slot wait.
+            accepted = {"started": False}
+            task = self._spawn(self.handle_socket(sock, ip, accepted_at + TLS_HANDSHAKE_TIMEOUT_S, accepted))
+            def before_start_done(_task, accepted=accepted, sock=sock, ip=ip):
+                # A coroutine cancelled before its first instruction cannot run finally.
+                if not accepted["started"]:
+                    accepted["started"] = True
+                    _abort_socket(sock)
+                    self.release_live_socket(ip)
+            task.add_done_callback(before_start_done)
 
-    async def handle_socket(self, sock, ip):
+    def release_live_socket(self, ip):
+        self.live_total -= 1
+        self.per_ip[ip] -= 1
+        if self.per_ip[ip] <= 0:
+            del self.per_ip[ip]
+
+    async def handle_socket(self, sock, ip, tls_deadline=None, accepted=None):
+        if accepted is not None:
+            accepted["started"] = True
         loop = asyncio.get_event_loop()
         writer = None
+        owner, attachment, tls = None, None, None
         path = "-"
         try:
+            tls_deadline = tls_deadline if tls_deadline is not None else now() + TLS_HANDSHAKE_TIMEOUT_S
             reader = asyncio.StreamReader()
             protocol = asyncio.StreamReaderProtocol(reader)
-            if self.ssl_ctx is not None and self.openssl_enabled:
-                tls = OpenSSLBIOTransport(self.ssl_ctx, protocol, loop)
-                async with self.tls_sem:
-                    await loop.connect_accepted_socket(lambda: tls, sock)
-                    sock = None
-                    try:
-                        transport = await asyncio.wait_for(tls.ready, TLS_HANDSHAKE_TIMEOUT_S)
-                    except BaseException:
-                        tls.abort()
-                        raise
-            elif self.ssl_ctx is not None:
-                kw = {"ssl": self.ssl_ctx}
-                if sys.version_info >= (3, 7):
-                    kw["ssl_handshake_timeout"] = TLS_HANDSHAKE_TIMEOUT_S
-                async with self.tls_sem:
-                    transport, _ = await asyncio.wait_for(
-                        loop.connect_accepted_socket(lambda: protocol, sock, **kw),
-                        TLS_HANDSHAKE_TIMEOUT_S + 1.0)
-            else:
-                transport, _ = await loop.connect_accepted_socket(lambda: protocol, sock)
+
+            async def before_deadline(awaitable):
+                remaining = tls_deadline - now()
+                if remaining <= 0:
+                    # Close an unstarted coroutine without producing a warning.
+                    if hasattr(awaitable, "close"):
+                        awaitable.close()
+                    raise asyncio.TimeoutError()
+                return await asyncio.wait_for(awaitable, remaining)
+
+            slot = False
+            try:
+                if self.ssl_ctx is not None:
+                    await before_deadline(self.tls_sem.acquire())
+                    slot = True
+                if now() >= tls_deadline:
+                    raise asyncio.TimeoutError()
+                # No TLS object is allocated while a connection is queued for a slot.
+                application = protocol
+                kw = {}
+                if self.ssl_ctx is not None and self.openssl_enabled:
+                    tls = OpenSSLBIOTransport(self.ssl_ctx, protocol, loop)
+                    application = tls
+                elif self.ssl_ctx is not None:
+                    kw["ssl"] = self.ssl_ctx
+                    if sys.version_info >= (3, 7):
+                        kw["ssl_handshake_timeout"] = max(0.001, tls_deadline - now())
+                owner = AcceptedSocketProtocol(application)
+                attachment = asyncio.ensure_future(loop.connect_accepted_socket(lambda: owner, sock, **kw))
+                attachment.add_done_callback(owner.attachment_done)
+                # Shield separates the deadline from a late attachment callback.
+                # On timeout the ownership guard aborts both current and later transports.
+                transport, _ = await before_deadline(asyncio.shield(attachment))
+                sock = None  # the transport owns it now
+                if tls is not None:
+                    transport = await before_deadline(tls.ready)
+            except BaseException:
+                if tls is not None:
+                    tls.abort()
+                if owner is not None:
+                    owner.abort()
+                if attachment is not None:
+                    attachment.cancel()
+                raise
+            finally:
+                if slot:
+                    self.tls_sem.release()
             writer = asyncio.StreamWriter(transport, protocol, reader, loop)
             sock = None  # owned by the transport now
 
             head_bytes, leftover = await self.read_head(reader)
+            method, target, headers = self.parse_head(head_bytes)
             if self.is_api_request(head_bytes):     # before any cookie/session logic
                 path = "/api"
                 await self.handle_api(head_bytes, leftover, reader, writer, ip)
                 await self.flush_close(writer)
                 return
-            method, target, headers = self.parse_head(head_bytes)
             split = urllib.parse.urlsplit(target)
             path = split.path
             query = urllib.parse.parse_qs(split.query)
@@ -2301,9 +2444,14 @@ class Gateway:
                 await self.ui_once(session, token, head_bytes, reader, writer, ip)
             else:
                 await self.splice(session, token, is_ws, head_bytes, leftover, reader, writer, ip)
-        except AuthUnavailable:
+        except ApiReject as exc:
             if writer is not None:
-                self.json_resp(writer, 503, {"error": "auth_unavailable"})
+                self.json_resp(writer, exc.status, {"error": exc.error})
+                await self.flush_close(writer)
+        except AuthUnavailable as exc:
+            if writer is not None:
+                self.json_resp(writer, 503, {"error": exc.error, "retry_after_seconds": exc.retry_after},
+                               extra=["Retry-After: %d" % exc.retry_after])
                 await self.flush_close(writer)
         except asyncio.CancelledError:
             raise   # (an Exception subclass before Python 3.8)
@@ -2324,19 +2472,19 @@ class Gateway:
                 except Exception:
                     pass
         finally:
-            if sock is not None:            # never reached a transport (handshake failed / timed out)
-                _abort_socket(sock)
-            if writer is not None:
-                try:
-                    writer.close()
-                    if hasattr(writer, "wait_closed"):   # Python 3.7+
-                        await asyncio.wait_for(writer.wait_closed(), TLS_CLOSE_TIMEOUT_S + 1.0)
-                except Exception:
-                    pass
-            self.live_total -= 1
-            self.per_ip[ip] -= 1
-            if self.per_ip[ip] <= 0:
-                del self.per_ip[ip]
+            try:
+                if sock is not None:        # no transport (handshake failed / timed out)
+                    _abort_socket(sock)
+                if writer is not None:
+                    try:
+                        writer.close()
+                        if hasattr(writer, "wait_closed"):   # Python 3.7+
+                            await asyncio.wait_for(writer.wait_closed(), TLS_CLOSE_TIMEOUT_S + 1.0)
+                    except Exception:
+                        pass
+            finally:
+                # A second cancellation during close must not bypass accounting.
+                self.release_live_socket(ip)
 
     # ---------- janitor: expiry, revocation severance, lifetimes ----------
 

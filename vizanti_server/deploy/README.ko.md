@@ -1,4 +1,4 @@
-# Vizanti gateway 1.5.0 — 접속 코드 PAKE 등록 / NIF device authority
+# Vizanti gateway 1.5.1 — 접속 코드 PAKE 등록 / NIF device authority
 
 기본 인증 방식은 `nif-device-v1`입니다. network-iface 인증 서비스가 등록 기기, 코드, 서명 챌린지와 세션을 관리합니다. 게이트웨이의 기존 `clients.json`/`pairing_code`는 읽지 않으며 자동으로 가져오지도 않습니다. 기존 방식은 개발/호환 시험에서 `--auth-mode legacy`를 명시한 경우에만 사용합니다. 이전 동작의 기록은 [README.legacy.ko.md](README.legacy.ko.md)이며 신규 설치 절차로 사용하지 마세요.
 
@@ -25,6 +25,13 @@ PC private key → HTTPS :5000 (certificate verified)
 - 정적 UI HTTP는 `GET`/`HEAD` 한 건마다 인증하고 `Connection: close`로 중계합니다. 요청 본문, Transfer-Encoding 및 파이프라인 후속 요청을 백엔드로 전달하지 않습니다. WebSocket만 양방향 중계를 유지합니다.
 - `/gw/info`는 `auth_mode=nif-device-v1`을 유지하고 TLS backend와 NIF native 엔진이 준비됐을 때만 `enrollment_protocols=["spake2-tls-exporter-v2"]`를 광고합니다. 미준비 상태에서 신규 등록은 실패하며 기존 로그인은 유지됩니다. 등록/로그인 경로의 HTTP 접속 가능 여부가 보호 기능 사용 권한을 뜻하지 않습니다.
 
+## 1.5.1 가용성·요청 경계 보강
+
+- TCP 수락 시점부터 TLS 슬롯 대기, transport 연결과 핸드셰이크 완료까지 **총 5초**만 허용합니다. TLS 객체는 슬롯을 확보한 뒤 생성하고, 시간 초과·취소·늦은 transport 연결의 socket/slot/접속 수를 회수합니다. 기존 전체 256개/접속원 32개 연결 상한과 동시 TLS 16개 제한은 유지합니다. HTTP 헤더 2초, PAKE 전체 60초, 업무 API의 기존 업로드 제한은 별도이며 5초로 줄이지 않습니다.
+- 공개 정보·로그인·UI·API와 PAKE 후속 요청 모두 라우팅 전에 HTTP/1.1, origin-form, 유효한 단일 Host, 헤더 구문과 framing을 검사합니다. Authorization/Cookie/Content-Length 등 보안 헤더의 중복, 잘못된 길이와 Transfer-Encoding을 거부합니다. Accept/Connection 등 반복 가능한 목록 헤더와 정상 WebSocket은 허용합니다. 요청 헤더는 수신 조각과 관계없이 마지막 CRLFCRLF를 포함해 **16,384바이트** 이하입니다.
+- 인증·등록의 접속원은 실제 TCP 소켓의 정규화된 IP입니다. JSON의 `peer_ip`나 X-Forwarded-For로 대상을 바꿀 수 없습니다. 업무 backend의 기존 token-only validate 계약은 유지합니다. NIF의 단기 제한 응답은 안정된 오류 이름, HTTP `Retry-After`와 선택적 JSON `retry_after_seconds`(1~600초)로 전달합니다. 서비스 장애는 무인증 경로로 전환하지 않고 503으로 닫습니다.
+- 함께 배포하는 NIF 보완은 서명 로그인·완료 결과 복구의 실패가 정상 기기 전체를 장시간 잠그는 경로를 분리합니다. PAKE의 로봇 전체 **5회/600초 선차감**과 60초·1회 코드 정책은 그대로 유지합니다. 접속원별 진입 제어는 임시 세션의 병렬 선점을 완화하며, 공용 Wi-Fi에서 순차적·다중 주소 등록 예산 소진을 완전히 막지는 못합니다. 등록망 분리 정책은 별도 운영 결정이며 이 업데이트는 방화벽·라우터·GUI 정책을 변경하지 않습니다.
+
 ## 로봇 설치
 
 새 `network-iface`와 native `rgt_pake` 라이브러리, `vizanti_server`, `python3-openssl`, 3.4.0 내비게이션 launch(Flask :5002/rosbridge :5001 루프백)가 함께 필요합니다. NIF REST/package 서버도 신규 인증 미들웨어가 적용된 버전을 배포해야 합니다. installer는 서비스 변경 전에 pyOpenSSL exporter API를 검사하고, 필요하면 Ubuntu `python3-openssl` 설치를 시도한 뒤 재검사합니다. 오프라인 설치는 의존성을 먼저 준비합니다.
@@ -38,7 +45,7 @@ sudo bash install_vizanti_gateway.sh nif-lock
 sudo bash install_vizanti_gateway.sh host-guard enforce
 # network-iface의 HTTP 바인드 변경은 노드/ROS 스택 재시작 후 적용됩니다.
 sudo systemctl status network-iface-auth vizanti-gateway
-curl -ks https://127.0.0.1:5000/gw/info   # 검사만: version=1.5.0 / enrollment_protocols 확인
+curl -ks https://127.0.0.1:5000/gw/info   # 검사만: version=1.5.1 / enrollment_protocols 확인
 openssl x509 -in /home/rgt/.rgt_data/vizanti_gateway/tls_cert.pem -noout -fingerprint -sha256
 ```
 
@@ -59,6 +66,7 @@ NIF 로컬 관리 소켓은 허용된 운영 계정만 사용할 수 있습니�
 ```bash
 python3 vizanti_server/tests/gateway_nif_auth_test.py
 python3 vizanti_server/tests/gateway_enrollment_tls_test.py
+python3 vizanti_server/tests/gateway_admission_test.py
 # 기존 프로토콜/프록시 회귀 시험은 테스트 내부에서 legacy 모드를 명시합니다.
 python3 vizanti_server/tests/gateway_selftest.py --tls
 python3 vizanti_server/tests/gateway_api_test.py --tls
@@ -67,3 +75,5 @@ python3 vizanti_server/tests/gateway_api_test.py --tls
 새 경계 시험은 실제 Unix 소켓과 TCP 백엔드를 사용하여 UID 검증, NIF 장애 시 503, 기존 로컬 등록/토큰의 우회 차단, 발급 요청의 키 소유 증명 전달, SSO의 NIF 세션 결합, 재시작/폐기 시 연결 종료, 백엔드 Authorization 전달을 확인합니다. 실제 NIF/로봇 연동 시험은 별도 배포 검증 기록을 참조합니다.
 
 TLS 등록 경계 시험은 실제 TLS 1.3의 양측 exporter 일치, 같은 인증서의 별도 TLS 연결 분리, JSON의 가짜 binding 무시, 순서 제한, business route 혼입 차단, 중복 Content-Length 및 TLS 1.2 등록 거부를 확인합니다. PAKE 엔진과 실제 클라이언트의 통합 검증은 별도 시험으로 수행합니다.
+
+admission 시험은 16KiB/16KiB+1 분할 경계, Host·버전·framing의 공통 거부, 정상 목록 헤더/WebSocket, 대기 중 취소·시간 초과와 늦은 transport 연결의 자원 회수를 검사합니다. 실제 TLS 시험은 대기 연결 만료 후 정상 등록 복구와 429/503 재시도 안내도 검사합니다. 모두 로컬 fixture이며 운영 로봇에 장애·부하 시험을 보내지 않습니다.

@@ -1347,8 +1347,8 @@ def run(be, procs):
     print("[1] /gw/info, 비인가 /api")
     r = gw_get("/gw/info")
     info = r.json()
-    check("/gw/info: version 1.5.0, api=1, api_services=[nif,pkg]",
-          info.get("version") == "1.5.0" and info.get("api") == 1 and info.get("api_services") == ["nif", "pkg"], info)
+    check("/gw/info: version 1.5.1, api=1, api_services=[nif,pkg]",
+          info.get("version") == "1.5.1" and info.get("api") == 1 and info.get("api_services") == ["nif", "pkg"], info)
     r = none_reach("토큰 없는 /api -> 401 (백엔드 미접촉)", lambda: api_req("GET", "/api/nif/uid"), 401)
     check("401 에 WWW-Authenticate: Bearer + JSON", r.headers.get("www-authenticate") == "Bearer"
           and r.json() == {"error": "unauthorized"}, r.headers)
@@ -1590,8 +1590,8 @@ def run(be, procs):
         none_reach("%s -> %d" % (label, want), lambda: send_raw(data), want)
     mark = be.mark()
     r = send_raw(b"POST http://127.0.0.1/api/nif/navi/request HTTP/1.1\r\nHost: r\r\n" + auth + b"Content-Length: 2\r\n\r\n{}")
-    check("absolute-form 대상 -> API 로 라우팅 안 됨 (거부, 백엔드 미접촉)",
-          r.status in (None, 401) and not be.since(mark), r)
+    check("absolute-form 대상 -> 공통 구문 검사에서 400 (백엔드 미접촉)",
+          r.status == 400 and not be.since(mark), r)
     mark = be.mark()
     t0 = time.time()
     r = send_raw(b"POST /api/nif/navi/request HTTP/1.1\nHost: r\n" + auth.replace(b"\r\n", b"\n")
