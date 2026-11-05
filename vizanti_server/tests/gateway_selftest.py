@@ -176,7 +176,7 @@ def ws_upgrade(cookie=None, origin=b"http://127.0.0.1:%d" % P_GW):
 
 
 def gw_cli(*args, data_dir):
-    return subprocess.run([sys.executable, GW, *args, "--data-dir", data_dir],
+    return subprocess.run([sys.executable, GW, *args, "--auth-mode", "legacy", "--data-dir", data_dir],
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
 
 
@@ -221,7 +221,7 @@ def main():
     backends.start()
 
     gw = subprocess.Popen(
-        [sys.executable, GW, "serve", *([] if USE_TLS else ["--no-tls"]), "--listen-port", str(P_GW),
+        [sys.executable, GW, "serve", "--auth-mode", "legacy", *([] if USE_TLS else ["--no-tls"]), "--listen-port", str(P_GW),
          "--flask-port", str(P_FLASK), "--ws-port", str(P_WS),
          "--data-dir", data_dir, "--robot-uid-file", uid_file,
          "--janitor-period", str(JANITOR_S)],

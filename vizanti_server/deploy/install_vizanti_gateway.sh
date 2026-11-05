@@ -14,13 +14,13 @@
 #
 # 정식 설치가 하는 일
 #   - 전제 검사: 게이트웨이 바이너리, python3-cryptography, 포트 5000 비점유, 3.4.0 nav launch 적용 여부
-#   - TLS 자가서명 인증서 생성 (로봇별, 10년) — 편집기가 TOFU 로 핀
+#   - TLS 자가서명 인증서 생성 (로봇별, 10년) — 최초 등록 전 독립 경로로 지문 확인
 #   - vizanti-firewall.service + vizanti-gateway.service 설치/검증/기동 (재부팅 영속). 재실행(업그레이드·롤백)도
 #     방화벽 룰을 다시 적용하고 게이트웨이를 재시작한 뒤 /gw/info 의 version 이 설치본과 같은지 확인
-#   - /etc/vizanti/nif.mode(없을 때만 open), /etc/vizanti/host-guard.conf(없을 때만 MODE=observe) 생성 후
-#     vizanti-host-guard.service 설치·적용 — 첫 설치는 아무것도 막지 않음 (nif open + observe: 기록만)
+#   - /etc/vizanti/nif.mode(없을 때만 lock), /etc/vizanti/host-guard.conf(없을 때만 MODE=enforce) 생성 후
+#     vizanti-host-guard.service 설치·적용 — 첫 설치부터 LAN 우회 포트 차단 (lock + enforce)
 #   - ufw 활성 로봇이면 5000/tcp allow
-#   - 첫 페어링 토큰 발급 — 등록된 PC 도 유효한 대기 토큰도 없을 때만 (재실행은 대기 중인 토큰을 건드리지 않음)
+#   - 신규 인증은 network-iface 단일 권위. 게이트웨이는 페어링 코드/기기 목록을 발급·저장하지 않음
 #
 # 전제: colcon 설치로 /opt/robot/rgt_ws/common/lib/vizanti_server/vizanti_gateway.py 가 존재하고,
 #       /opt/robot/rgt_ws/navigation/share/rgt_nav3_launch/launch/vizanti.launch.py 가 3.4.0 버전
@@ -149,7 +149,7 @@ write_default_hg_conf() {
 # 셸로 source 되지 않음: KEY=VALUE 줄만 인식. 목록은 공백 또는 쉼표로 구분.
 
 # observe | enforce | off   (host-guard observe|enforce|off 명령이 이 줄을 바꾼다)
-MODE=observe
+MODE=enforce
 
 # 로봇 하드웨어망 (MCU UDP 링크, LiDAR): 이 출발지는 그 대역이 연결된 NIC 로 들어올 때 모든 포트 허용. IPv6 CIDR 도 가능
 # 로봇에 없는 대역(예: LiDAR NIC 없는 기종의 192.168.158.0/24)은 빼 둘 것
@@ -183,12 +183,12 @@ write_nif_mode() {   # $1 = open|lock — network-iface 가 rgt 사용자로 읽
 ensure_vizanti_etc() {   # 없을 때만 기본값 생성 (재설치가 운영자 선택을 덮지 않음)
     install -d -m 755 "$VZ_ETC"
     if [[ ! -f $NIF_MODE_FILE ]]; then
-        write_nif_mode open
-        echo "[nif] $NIF_MODE_FILE = open (기본: 51231/51233 은 기존처럼 LAN 노출 — 호출자 조사 후 nif-lock)"
+        write_nif_mode lock
+        echo "[nif] $NIF_MODE_FILE = lock (기본: 51231/51233 루프백 전용)"
     fi
     if [[ ! -f $HG_CONF ]]; then
         write_default_hg_conf
-        echo "[guard] $HG_CONF 기본값 생성 (MODE=observe: 막지 않고 기록만)"
+        echo "[guard] $HG_CONF 기본값 생성 (MODE=enforce: 기본 거부)"
     fi
 }
 
@@ -1061,7 +1061,7 @@ if [[ -n $OLD_NAV ]]; then
 fi
 [[ -f $NAV_LAUNCH ]] || echo "경고: $NAV_LAUNCH 없음 — rgt_nav3_launch 배치를 확인하세요 (bringup 이 vizanti 를 띄우지 못하면 게이트웨이는 502)" >&2
 
-# 1) 데이터 디렉터리 + TLS 인증서 (로봇별 자가서명 — 편집기가 TOFU 로 핀)
+# 1) 데이터 디렉터리 + TLS 인증서 (로봇별 자가서명 — 독립 경로 지문 확인 필수)
 install -d -m 700 -o $GW_USER -g $GW_USER "$DATA_DIR"
 if [[ ! -f "$DATA_DIR/tls_cert.pem" ]]; then
     ROBOT_UID=$(cat /rgt/robot_uid 2>/dev/null || echo unknown)
@@ -1074,19 +1074,60 @@ if [[ ! -f "$DATA_DIR/tls_cert.pem" ]]; then
 fi
 
 # 2) 방화벽 벨트 (전용 유닛, 재부팅 영속)
+# NIF 단일 권위가 현재 TLS 인증서로 실제 응답해야 배포를 계속합니다.
+# install_auth.sh가 서비스/RuntimeDirectory를 설치하며 이 스크립트는 중복 소켓을 만들지 않습니다.
+[[ -x /usr/local/bin/rgt-nif-auth ]] || die "NIF 인증 서비스 미설치 — network-iface/deploy/install_auth.sh를 먼저 실행하세요"
+systemctl enable network-iface-auth.service
+systemctl start network-iface-auth.service || die "network-iface-auth.service 시작 실패"
+NIF_AUTH_DEADLINE=$((SECONDS + 20))
+NIF_AUTH_READY=no
+while (( SECONDS < NIF_AUTH_DEADLINE )); do
+    if sudo -u "$GW_USER" python3 - "$DATA_DIR/tls_cert.pem" <<'PY'
+import hashlib, json, os, socket, ssl, struct, sys
+try:
+    with open(sys.argv[1]) as stream:
+        fingerprint = hashlib.sha256(ssl.PEM_cert_to_DER_cert(stream.read())).hexdigest()
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(2)
+        connection.connect('/run/rgt-network-iface/gateway.sock')
+        uid = struct.unpack('3i', connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1]
+        if uid != os.geteuid():
+            raise ValueError('unexpected authority UID')
+        connection.sendall(b'{"v":1,"op":"info"}\n')
+        with connection.makefile('rb') as stream:
+            raw = stream.readline(65537)
+        if len(raw) > 65536 or not raw.endswith(b'\n'):
+            raise ValueError('invalid response')
+    reply = json.loads(raw)
+    ready = (reply.get('v') == 1 and reply.get('ok') is True
+             and reply.get('auth_mode') == 'nif-device-v1'
+             and reply.get('cert_fingerprint') == fingerprint)
+except Exception:
+    ready = False
+sys.exit(0 if ready else 1)
+PY
+    then
+        NIF_AUTH_READY=yes
+        break
+    fi
+    sleep 1
+done
+[[ $NIF_AUTH_READY == yes ]] || die "NIF 인증 서비스가 현재 인증서로 응답하지 않음 — journalctl -u network-iface-auth 확인"
+echo "[auth] NIF 단일 권위/인증서 지문 일치 확인"
+
 install_firewall "$SHARE_DIR/firewall-vizanti.nft" gateway
 echo "[fw] 5000 허용(연결수/속도 제한), 5001-5003 외부 차단"
 
 # 2b) /etc/vizanti 설정(기존 값 보존) + 호스트 기본 거부 방화벽.
-#     첫 설치 = nif open + observe: 아무것도 막지 않고 기록만 함. 재설치는 운영자가 고른 MODE/nif 를 유지.
-#     host guard 실패는 게이트웨이 설치를 막지 않음 (경고 후 계속 — 원인 해결 뒤 host-guard reload)
+#     첫 설치 = nif lock + enforce. 재설치는 운영자가 고른 MODE/nif 를 유지.
+#     host guard 실패 시 설치를 중단하여 차단되지 않은 배포를 성공으로 보고하지 않음
 ensure_vizanti_etc
 set +e
 ( set -e; hg_apply )
 HG_RC=$?
 set -e
 if (( HG_RC != 0 )); then
-    echo "경고: host guard 적용 실패 — 게이트웨이 설치는 계속합니다. 원인 해결 후: sudo bash $0 host-guard reload" >&2
+    die "host guard 적용 실패 — 설치 중단. 원인 해결 후: sudo bash $0 host-guard reload"
 fi
 
 # 3) 게이트웨이 유닛 — 재설치·업그레이드·롤백도 restart: 이미 떠 있으면 start(enable --now)는 옛 코드를 그대로 둠
@@ -1117,17 +1158,11 @@ if [[ $GW_GOT != "$GW_WANT" ]]; then
 fi
 echo "[unit] vizanti-gateway.service 기동 (version $GW_GOT)"
 
-# 4) 첫 페어링 토큰 — 등록된 PC 도, 유효한(24h) 대기 토큰도 없을 때만. 재설치(업그레이드·롤백)가 운영자가 발급해 둔
-#    토큰(예: RCS 용 --perms read,drive)을 전체 권한 토큰으로 덮어쓰지 않게 (반드시 게이트웨이 사용자로 — root 로 만들면 데몬이 읽지 못함)
-#    목록은 변수로 먼저 받음 ("| grep -q" 는 pipefail 에서 SIGPIPE 로 판정이 뒤집힐 수 있음)
-GW_CLIENTS=$(sudo -u $GW_USER python3 "$GW_BIN" list-clients --data-dir "$DATA_DIR" 2>&1 || true)
-if grep -q '^no clients registered' <<< "$GW_CLIENTS" \
-   && [[ -z $(find "$DATA_DIR" -maxdepth 1 -name pairing_code -size +0 -mmin -1440 2>/dev/null) ]]; then
-    sudo -u $GW_USER python3 "$GW_BIN" newcode --data-dir "$DATA_DIR"
-else
-    echo "[pair] 등록된 PC 또는 유효한 대기 토큰이 있어 새로 발급하지 않음 (대기 토큰 유지)"
-    echo "       새 PC: sudo -u $GW_USER python3 $GW_BIN newcode   (RCS: newcode --perms read,drive)"
-fi
+# 4) 접속 코드/등록 기기의 유일한 권위는 NIF. legacy clients.json/pairing_code는 사용하지 않음.
+echo "[auth] NIF device authority: /run/rgt-network-iface/gateway.sock"
+echo "       코드 발급/기기 관리: rgt-nif-auth --help (로봇 GUI는 별도 구현)"
+echo "       최초 PC 등록 전 독립 SSH 채널에서 인증서 SHA256 지문을 확인하세요."
+openssl x509 -in "$DATA_DIR/tls_cert.pem" -noout -fingerprint -sha256
 
 cat <<EOF
 

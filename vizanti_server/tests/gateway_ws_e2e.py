@@ -93,7 +93,7 @@ async def main():
                     "-days", "1", "-nodes", "-subj", "/CN=e2e"], check=True, capture_output=True)
 
     ws_server = await websockets.serve(rosbridge_standin, "127.0.0.1", P_WS, max_size=None)
-    gw = subprocess.Popen([sys.executable, GW, "serve", "--listen-port", str(P_GW),
+    gw = subprocess.Popen([sys.executable, GW, "serve", "--auth-mode", "legacy", "--listen-port", str(P_GW),
                            "--flask-port", str(P_FLASK), "--ws-port", str(P_WS),
                            "--data-dir", data_dir, "--robot-uid-file", uid_file, "--janitor-period", "1"],
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -111,7 +111,7 @@ async def main():
         priv = Ed25519PrivateKey.generate()
         pub = base64.b64encode(priv.public_key().public_bytes(
             serialization.Encoding.Raw, serialization.PublicFormat.Raw)).decode()
-        subprocess.run([sys.executable, GW, "newcode", "--data-dir", data_dir], capture_output=True)
+        subprocess.run([sys.executable, GW, "newcode", "--auth-mode", "legacy", "--data-dir", data_dir], capture_output=True)
         with open(os.path.join(data_dir, "pairing_code")) as f:
             code = f.read().strip()
         with open(os.path.join(data_dir, "tls_cert.pem")) as f:
@@ -157,7 +157,7 @@ async def main():
                                       additional_headers={"Cookie": cookie})
         await ws.send(json.dumps({"op": "call_service", "id": "c2", "service": "/x", "args": {}}))
         await asyncio.wait_for(ws.recv(), 3)
-        subprocess.run([sys.executable, GW, "revoke", "e2e", "--data-dir", data_dir], capture_output=True)
+        subprocess.run([sys.executable, GW, "revoke", "e2e", "--auth-mode", "legacy", "--data-dir", data_dir], capture_output=True)
         t0 = time.time()
         try:
             await asyncio.wait_for(ws.recv(), 6)

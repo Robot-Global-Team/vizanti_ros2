@@ -3,8 +3,8 @@
 # 설치: install_vizanti_gateway.sh 가 /etc/systemd/system/ 에 복사 후 enable
 [Unit]
 Description=RGT vizanti authenticating gateway (port 5000)
-After=network-online.target vizanti-firewall.service
-Wants=network-online.target
+After=network-online.target vizanti-firewall.service network-iface-auth.service
+Wants=network-online.target network-iface-auth.service
 # 무인 로봇: 영구 failed 가 재시작 루프보다 나쁨 -> 제한 없이 백오프 재시도
 # (구버전 vizanti launch 가 5000 을 점유 중이면 nav 재시작 전까지 'address already in use' 로 재시도하는 것이 정상)
 StartLimitIntervalSec=0
@@ -13,7 +13,7 @@ StartLimitIntervalSec=0
 Type=simple
 User=rgt
 Group=rgt
-ExecStart=/usr/bin/python3 /opt/robot/rgt_ws/common/lib/vizanti_server/vizanti_gateway.py serve
+ExecStart=/usr/bin/python3 /opt/robot/rgt_ws/common/lib/vizanti_server/vizanti_gateway.py serve --auth-mode nif-device-v1
 Restart=on-failure
 RestartSec=3
 RestartSteps=5

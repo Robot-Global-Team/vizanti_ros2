@@ -620,7 +620,7 @@ ISSUED = []     # every token handed out: none may ever appear in the gateway lo
 
 
 def gw_cli(*args):
-    return subprocess.run([sys.executable, GW] + list(args) + ["--data-dir", DATA],
+    return subprocess.run([sys.executable, GW] + list(args) + ["--auth-mode", "legacy", "--data-dir", DATA],
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
 
 
@@ -1203,7 +1203,7 @@ def main():
     be = Backends()
     be.start()
     common = ([] if USE_TLS else ["--no-tls"]) + [
-        "--data-dir", DATA, "--robot-uid-file", UID_FILE, "--nif-port", str(P_NIF), "--pkg-port", str(P_PKG),
+        "--auth-mode", "legacy", "--data-dir", DATA, "--robot-uid-file", UID_FILE, "--nif-port", str(P_NIF), "--pkg-port", str(P_PKG),
         "--janitor-period", "1", "--flask-port", "15999", "--ws-port", "15998"]
     gw1 = subprocess.Popen([sys.executable, GW, "serve", "--listen-port", str(P_GW1), "--api-log-period", "1"] + common,
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
@@ -1347,8 +1347,8 @@ def run(be, procs):
     print("[1] /gw/info, 비인가 /api")
     r = gw_get("/gw/info")
     info = r.json()
-    check("/gw/info: version 1.3.0, api=1, api_services=[nif,pkg]",
-          info.get("version") == "1.3.0" and info.get("api") == 1 and info.get("api_services") == ["nif", "pkg"], info)
+    check("/gw/info: version 1.4.0, api=1, api_services=[nif,pkg]",
+          info.get("version") == "1.4.0" and info.get("api") == 1 and info.get("api_services") == ["nif", "pkg"], info)
     r = none_reach("토큰 없는 /api -> 401 (백엔드 미접촉)", lambda: api_req("GET", "/api/nif/uid"), 401)
     check("401 에 WWW-Authenticate: Bearer + JSON", r.headers.get("www-authenticate") == "Bearer"
           and r.json() == {"error": "unauthorized"}, r.headers)

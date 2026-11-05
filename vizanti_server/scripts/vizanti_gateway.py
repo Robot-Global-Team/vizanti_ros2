@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """vizanti_gateway.py - authenticating TLS gateway in front of vizanti.
 
+Default auth mode (1.4.0+): nif-device-v1. Registrations and cryptographic
+credentials belong exclusively to network-iface's local Unix-socket authority.
+The gateway checks every protected request there and forwards NIF bearer tokens
+to the protected REST/package backends. A missing authority fails closed (503).
+Legacy clients.json/newcode behavior below is available only with --auth-mode legacy.
+
 The only externally exposed vizanti port. Everything behind it is loopback:
   flask (server.py)       127.0.0.1:5002
   rosbridge / rws         127.0.0.1:5001   (5001 is also a contract with the on-board
@@ -83,7 +89,7 @@ import urllib.parse
 import uuid
 from http.client import responses as HTTP_REASONS
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 SIGN_CONTEXT = b"vizanti-gw-v2"          # session signature: SIGN_CONTEXT|fp|client_id|nonce
 API_SIGN_CONTEXT = b"rgt-robot-api-v1"   # API token signature: API_SIGN_CONTEXT|fp|client_id|nonce
 PAIR_PROOF_CONTEXT = b"vizanti-gw-pair-v1"  # pairing proof: HMAC(code, CTX|fp|pubkey|name)
@@ -220,6 +226,10 @@ class ApiReject(Exception):
         Exception.__init__(self, error)
         self.status = status
         self.error = error
+
+
+class AuthUnavailable(Exception):
+    """The NIF authority cannot safely answer. Never fall back to local registrations."""
 
 
 def client_perms(client):
@@ -754,6 +764,10 @@ def now() -> float:
 class Gateway:
     def __init__(self, args):
         self.args = args
+        self.auth_mode = getattr(args, "auth_mode", "legacy")
+        self.nif_auth_socket = getattr(args, "nif_auth_socket", "/run/rgt-network-iface/gateway.sock")
+        self.nif_auth_uid = getattr(args, "nif_auth_uid", os.getuid())
+        self.nif_instance = None
         self.data_dir = os.path.expanduser(args.data_dir)
         self.clients_path = os.path.join(self.data_dir, "clients.json")
         self.pairing_code_path = os.path.join(self.data_dir, "pairing_code")
@@ -787,7 +801,144 @@ class Gateway:
         self.api_conns = {}     # id -> {client_id, cwriter, bwriter, status, nin, nout, complete, severed}
         self.api_get_stats = {} # (name, id8, ip, svc, path, status) -> count, flushed by the janitor
         self.api_get_since = now()
-        self.load_clients(initial=True)
+        if self.auth_mode == "legacy":
+            self.load_clients(initial=True)
+
+    async def nif_auth(self, op, **fields):
+        try:
+            return await asyncio.wait_for(self._nif_auth(op, **fields), 2.0)
+        except asyncio.TimeoutError:
+            raise AuthUnavailable("authority deadline exceeded")
+
+    async def _nif_auth(self, op, **fields):
+        """One bounded JSON-line RPC to the local, UID-checked NIF authority."""
+        reader, writer = None, None
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_unix_connection(self.nif_auth_socket, limit=65536), 1.0)
+            peer = writer.get_extra_info("socket")
+            creds = peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+            if struct.unpack("3i", creds)[1] != self.nif_auth_uid:
+                raise AuthUnavailable("unexpected authority UID")
+            request = dict(fields, v=1, op=op, fp=self.cert_fingerprint or "")
+            raw = json.dumps(request, separators=(",", ":")).encode("utf-8") + b"\n"
+            if len(raw) > 65536:
+                raise AuthUnavailable("authority request too large")
+            writer.write(raw)
+            await asyncio.wait_for(writer.drain(), 1.0)
+            line = await asyncio.wait_for(reader.readline(), 1.5)
+            if not line.endswith(b"\n") or len(line) > 65536:
+                raise AuthUnavailable("incomplete authority response")
+            reply = json.loads(line.decode("utf-8"))
+            if not isinstance(reply, dict) or reply.get("v") != 1 or not isinstance(reply.get("ok"), bool):
+                raise AuthUnavailable("invalid authority response")
+            instance = reply.get("instance_id")
+            if not isinstance(instance, str) or not instance:
+                raise AuthUnavailable("authority instance missing")
+            if self.nif_instance is not None and instance != self.nif_instance:
+                self.sessions.clear()
+                self.otts.clear()
+                self.sever(lambda c: True, "authority_restart")
+            self.nif_instance = instance
+            if not reply["ok"] and reply.get("status") == 503:
+                raise AuthUnavailable("authority rejected service state")
+            return reply
+        except (OSError, ValueError, asyncio.TimeoutError, asyncio.IncompleteReadError) as e:
+            raise AuthUnavailable(type(e).__name__)
+        finally:
+            if writer is not None:
+                writer.close()
+
+    @staticmethod
+    def auth_status(reply):
+        value = reply.get("status", 403)
+        return value if isinstance(value, int) and value in (400, 401, 403, 409, 429, 503) else 403
+
+    async def nif_gateway(self, method, path, query, headers, reader, writer, ip, leftover):
+        """NIF mode owns *all* registrations, challenges and bearer/UI sessions."""
+        if method == "POST" and path in ("/gw/pair", "/gw/challenge", "/gw/api-token", "/gw/session"):
+            body = await self.read_json_body(reader, headers, leftover)
+            ops = {"/gw/pair": "pair", "/gw/challenge": "challenge",
+                   "/gw/api-token": "api_token", "/gw/session": "session"}
+            allowed = ("client_id", "pubkey", "proof", "request_id", "enroll_sig", "nonce", "sig", "purpose")
+            fields = {k: body[k] for k in allowed if k in body}
+            if path == "/gw/pair":
+                fields["name"] = body.get("client_name", "")
+            reply = await self.nif_auth(ops[path], peer_ip=ip, **fields)
+            if not reply["ok"]:
+                return self.json_resp(writer, self.auth_status(reply), {"error": reply.get("error", "auth_failed")})
+            if path == "/gw/session":
+                if not isinstance(reply.get("token"), str) or "ui" not in reply.get("perms", []):
+                    raise AuthUnavailable("invalid authority UI session")
+                ott = secrets.token_urlsafe(32)
+                self.otts[ott] = {"client_id": reply["client_id"], "ip": ip,
+                    "expires": now() + OTT_TTL_S, "nif_token": reply["token"],
+                    "nif_instance": reply["instance_id"], "ttl": reply["ttl"]}
+                return self.json_resp(writer, 200, {"ott": ott, "ott_ttl": OTT_TTL_S,
+                    "robot_uid": self.robot_uid(), "session_ttl": reply["ttl"]})
+            # Do not expose internal authority state or any extra secret field to clients.
+            keys = {"/gw/pair": ("client_id", "perms"),
+                    "/gw/challenge": ("nonce", "ttl"),
+                    "/gw/api-token": ("token", "ttl", "perms")}[path]
+            result = {k: reply[k] for k in keys if k in reply}
+            if path == "/gw/challenge":
+                result["cert_fingerprint"] = self.cert_fingerprint
+            if path == "/gw/api-token":
+                result["robot_uid"] = self.robot_uid()
+            return self.json_resp(writer, 200, result)
+        if path == "/gw/sso" and method == "GET":
+            ott = (query.get("ott") or [""])[0]
+            entry = self.otts.pop(ott, None)
+            if entry is None or entry["expires"] <= now() or entry["ip"] != ip:
+                return self.respond(writer, 403, PAGE_SSO_EXPIRED, "text/html; charset=utf-8")
+            reply = await self.nif_auth("validate", token=entry["nif_token"], purpose="ui", peer_ip=ip)
+            if (not reply["ok"] or reply["instance_id"] != entry["nif_instance"]
+                    or "ui" not in reply.get("perms", [])):
+                return self.respond(writer, 403, PAGE_SSO_EXPIRED, "text/html; charset=utf-8")
+            token = entry["nif_token"]
+            ttl = max(1, min(SESSION_TTL_S, int(reply["ttl"])))
+            self.sessions[token] = {"client_id": reply["client_id"], "ip": ip,
+                "expires": now() + ttl, "nif_instance": reply["instance_id"]}
+            cookie = f"{COOKIE_NAME}={token}; Path=/; Max-Age={ttl}; HttpOnly; SameSite=Strict"
+            if not self.args.no_tls:
+                cookie += "; Secure"
+            return self.respond(writer, 302, b"", "text/plain", extra=["Set-Cookie: " + cookie, "Location: /"])
+        if path == "/gw/logout" and method == "GET":
+            token = self.cookie_token(headers)
+            entry = self.sessions.get(token)
+            if entry and entry["ip"] == ip:
+                self.sessions.pop(token, None)
+                self.sever(lambda c: c["token"] == token, "logout")
+                await self.nif_auth("logout", token=token, purpose="ui", peer_ip=ip)
+            return self.respond(writer, 302, b"", "text/plain", extra=["Location: /",
+                f"Set-Cookie: {COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict"])
+        return self.json_resp(writer, 404, {"error": "not_found"})
+
+    async def authorize_ui(self, headers, ip):
+        if self.auth_mode == "legacy":
+            return self.session_for(headers, ip)
+        token = self.cookie_token(headers)
+        entry = self.sessions.get(token)
+        if not entry or entry["expires"] <= now() or entry["ip"] != ip:
+            return None, None
+        reply = await self.nif_auth("validate", token=token, purpose="ui", peer_ip=ip)
+        if (not reply["ok"] or "ui" not in reply.get("perms", [])
+                or reply["instance_id"] != entry["nif_instance"]):
+            self.sessions.pop(token, None)
+            self.sever(lambda c: c["token"] == token, "revoked")
+            return None, None
+        return entry, token
+
+    async def authorize_api(self, value, ip):
+        if self.auth_mode == "legacy":
+            return self.api_auth(value, ip)
+        scheme, _, token = (value or "").partition(" ")
+        if scheme.lower() != "bearer" or not _API_TOKEN_RE.fullmatch(token):
+            return None, None
+        reply = await self.nif_auth("validate", token=token, purpose="api", peer_ip=ip)
+        if not reply["ok"]:
+            return None, None
+        return reply["client_id"], set(reply.get("perms", []))
 
     def _spawn(self, coro):
         task = asyncio.ensure_future(coro)
@@ -1047,7 +1198,10 @@ class Gateway:
             return self.json_resp(writer, 200, {
                 "service": "vizanti-gateway", "version": VERSION,
                 "tls": not self.args.no_tls, "cert_fingerprint": self.cert_fingerprint,
-                "api": 1, "api_services": list(API_SERVICES)})
+                "api": 1, "api_services": list(API_SERVICES), "auth_mode": self.auth_mode})
+
+        if self.auth_mode == "nif-device-v1":
+            return await self.nif_gateway(method, path, query, headers, reader, writer, ip, leftover)
 
         if path == "/gw/pair" and method == "POST":
             ts = self.pair_attempts.setdefault(ip, [])
@@ -1242,6 +1396,74 @@ class Gateway:
                     except Exception:
                         pass
 
+    async def ui_once(self, session, token, head_bytes, reader, writer, ip):
+        """NIF mode static UI: one authenticated GET/HEAD per connection, no opaque HTTP tunnel.
+
+        Any pipelined bytes are discarded. Only WebSocket upgrades retain bidirectional splicing.
+        This prevents a later HTTP request from sharing the first request's authorization check.
+        """
+        lines = head_bytes[:-4].split(b"\r\n")
+        try:
+            if _API_BAD_REQ_BYTES_RE.search(head_bytes):
+                raise ValueError()
+            match = _API_REQUEST_LINE_RE.fullmatch(lines[0].decode("ascii"))
+            if not match:
+                raise ValueError()
+            method, target = match.groups()
+            parsed = {}
+            for raw in lines[1:]:
+                field = _API_HEADER_RE.fullmatch(raw.decode("ascii"))
+                if not field or raw.startswith((b" ", b"\t")):
+                    raise ValueError()
+                name, value = field.group(1).lower(), field.group(2)
+                if name in parsed and name in API_SINGLETON_HEADERS | {"cookie"}:
+                    raise ValueError()
+                parsed[name] = value
+            if ("host" not in parsed or "transfer-encoding" in parsed
+                    or ("content-length" in parsed and parsed["content-length"] != "0")):
+                raise ValueError()
+        except (ValueError, UnicodeError):
+            return self.json_resp(writer, 400, {"error": "bad_request"})
+        if method not in ("GET", "HEAD"):
+            return self.respond(writer, 405, b"", "text/plain", extra=["Allow: GET, HEAD"])
+        try:
+            breader, bwriter = await asyncio.wait_for(asyncio.open_connection(
+                self.args.flask_host, self.args.flask_port), 3.0)
+        except (OSError, asyncio.TimeoutError):
+            return self.respond(writer, 502, PAGE_BACKEND_DOWN, "text/html; charset=utf-8")
+        self.conn_seq += 1
+        conn = {"id": self.conn_seq, "client_id": session["client_id"], "token": token, "ip": ip,
+                "cwriter": writer, "bwriter": bwriter, "opened": now(), "last_active": now(), "nout": 0}
+        self.conns[conn["id"]] = conn
+        self.per_ip_splice[ip] = self.per_ip_splice.get(ip, 0) + 1
+        sent_head = False
+        try:
+            forward = ["%s %s HTTP/1.1" % (method, target),
+                       "Host: %s:%d" % (self.args.flask_host, self.args.flask_port), "Connection: close"]
+            for name in ("accept", "accept-encoding", "if-none-match", "if-modified-since", "range"):
+                if name in parsed:
+                    forward.append(name + ": " + parsed[name])
+            bwriter.write(("\r\n".join(forward) + "\r\n\r\n").encode("ascii"))
+            await asyncio.wait_for(bwriter.drain(), 3.0)
+            deadline = now() + 60
+            bhead, first = await self.api_backend_head(breader, deadline)
+            status, response, mode, length = rewrite_api_response_head(bhead)
+            writer.write(response)
+            sent_head = True
+            if method != "HEAD":
+                await self.api_stream(conn, breader, first, writer, mode, length, deadline)
+        except (OSError, ValueError, asyncio.TimeoutError):
+            if not sent_head:
+                self.json_resp(writer, 502, {"error": "backend_unavailable"})
+            else:
+                writer.transport.abort()
+        finally:
+            self.conns.pop(conn["id"], None)
+            self.per_ip_splice[ip] -= 1
+            if self.per_ip_splice[ip] <= 0:
+                del self.per_ip_splice[ip]
+            bwriter.close()
+
     async def splice(self, session, token, is_ws, head_bytes, leftover, reader, writer, ip):
         host, port = ((self.args.ws_host, self.args.ws_port) if is_ws
                       else (self.args.flask_host, self.args.flask_port))
@@ -1381,7 +1603,10 @@ class Gateway:
         if "origin" in headers:     # browsers never belong here (CSRF, DNS rebinding)
             self._warn("api-origin", ip, "api request with Origin rejected ip=%s", ip)
             return await self.api_reject(writer, reader, leftover, headers, length, 403, "forbidden")
-        client_id, perms = self.api_auth(headers.get("authorization"), ip)
+        try:
+            client_id, perms = await self.authorize_api(headers.get("authorization"), ip)
+        except AuthUnavailable:
+            return await self.api_reject(writer, reader, leftover, headers, length, 503, "auth_unavailable")
         if client_id is None:
             self._warn("api-unauth", ip, "api unauthenticated request ip=%s %s %s %s",
                        ip, method, svc, path[:80])
@@ -1410,6 +1635,9 @@ class Gateway:
         self.conn_seq += 1
         conn = {"id": self.conn_seq, "client_id": client_id, "cwriter": writer, "bwriter": None,
                 "status": None, "nin": 0, "nout": 0, "complete": False, "severed": None}
+        if self.auth_mode == "nif-device-v1":
+            conn["nif_token"] = headers.get("authorization", "").partition(" ")[2]
+            conn["ip"] = ip
         self.api_conns[conn["id"]] = conn
         try:
             route = self.api_routes.get((svc, method, path))
@@ -1417,6 +1645,7 @@ class Gateway:
                 conn["status"], conn["complete"] = 404, True
                 return await self.api_reject(writer, reader, leftover, headers, length, 404, "not_found")
             perm, cap, timeout = route
+            conn["required_perm"] = perm
             if perm not in perms:
                 conn["status"], conn["complete"] = 403, True
                 return await self.api_reject(writer, reader, leftover, headers, length, 403, "forbidden")
@@ -1494,6 +1723,13 @@ class Gateway:
         byte is in the kernel. A spool is released as soon as its last piece is read, the body in
         memory once it is sent. The response head is rewritten (rewrite_api_response_head) and the
         body streamed under the route deadline."""
+        if self.auth_mode == "nif-device-v1":
+            # A slow upload must not carry an old authorization into a later backend mutation.
+            granted = await self.nif_auth("validate", token=conn["nif_token"], purpose="api", peer_ip=conn["ip"])
+            route_perm = self.api_routes[(svc, method, path)][0]
+            if not granted["ok"] or route_perm not in granted.get("perms", []):
+                conn["status"], conn["complete"] = 401, True
+                return self.api_reply(writer, 401, "unauthorized")
         port = self.api_ports[svc]
         deadline = now() + timeout
         try:
@@ -1511,6 +1747,8 @@ class Gateway:
                 return
             lines = ["%s %s HTTP/1.1" % (method, path + ("?" + query if query else "")),
                      "Host: 127.0.0.1:%d" % port, "Connection: close"]
+            if self.auth_mode == "nif-device-v1":
+                lines.append("Authorization: Bearer " + conn["nif_token"])
             for name, canonical in API_FORWARD_HEADERS:
                 if name in headers:
                     lines.append("%s: %s" % (canonical, headers[name]))
@@ -1693,7 +1931,7 @@ class Gateway:
                 await self.flush_close(writer)
                 return
 
-            session, token = self.session_for(headers, ip)
+            session, token = await self.authorize_ui(headers, ip)
             is_ws = "websocket" in headers.get("upgrade", "").lower()
 
             if session is None:
@@ -1718,7 +1956,14 @@ class Gateway:
                 await self.flush_close(writer)
                 return
 
-            await self.splice(session, token, is_ws, head_bytes, leftover, reader, writer, ip)
+            if self.auth_mode == "nif-device-v1" and not is_ws:
+                await self.ui_once(session, token, head_bytes, reader, writer, ip)
+            else:
+                await self.splice(session, token, is_ws, head_bytes, leftover, reader, writer, ip)
+        except AuthUnavailable:
+            if writer is not None:
+                self.json_resp(writer, 503, {"error": "auth_unavailable"})
+                await self.flush_close(writer)
         except asyncio.CancelledError:
             raise   # (an Exception subclass before Python 3.8)
         except (ValueError, OSError, asyncio.TimeoutError, ssl.SSLError) as e:
@@ -1754,11 +1999,59 @@ class Gateway:
 
     # ---------- janitor: expiry, revocation severance, lifetimes ----------
 
+    async def nif_janitor(self):
+        """One batch snapshot; a missing authority severs live work rather than retaining access."""
+        ui = list(self.conns.values())
+        api = list(self.api_conns.values())
+        items = [{"token": c["token"], "purpose": "ui", "peer_ip": c["ip"]} for c in ui]
+        items += [{"token": c["nif_token"], "purpose": "api", "peer_ip": c["ip"]} for c in api]
+        if not items:
+            return
+        try:
+            reply = await self.nif_auth("validate_many", items=items)
+            results = reply.get("results")
+            if not reply["ok"] or not isinstance(results, list) or len(results) != len(items):
+                raise AuthUnavailable("invalid authority batch")
+        except AuthUnavailable:
+            results = [None] * len(items)
+        t = now()
+        for c, result in zip(ui, results[:len(ui)]):
+            valid = isinstance(result, dict) and result.get("ok") and "ui" in result.get("perms", [])
+            s = self.sessions.get(c["token"])
+            if (not valid or not s or s["expires"] <= t
+                    or t - c["opened"] > CONN_HARD_LIFETIME_S
+                    or t - c["last_active"] > CONN_IDLE_TIMEOUT_S):
+                self.sessions.pop(c["token"], None)
+                self.sever(lambda v, cid=c["id"]: v["id"] == cid, "authority_or_session")
+        for c, result in zip(api, results[len(ui):]):
+            valid = isinstance(result, dict) and result.get("ok")
+            # Any permission shrink severs in-flight requests; the next attempt checks its route.
+            if valid and c.get("required_perm"):
+                valid = c["required_perm"] in result.get("perms", [])
+            if valid:
+                continue
+            c["severed"] = "authority_or_revoked"
+            try:
+                if c["bwriter"] is not None:
+                    _reset_transport(c["bwriter"].transport)
+            except Exception:
+                pass
+            try:
+                c["cwriter"].transport.abort()
+            except Exception:
+                pass
+
     async def janitor(self):
         while True:
-            await asyncio.sleep(self.args.janitor_period)
+            await asyncio.sleep(min(self.args.janitor_period, 1.0) if self.auth_mode == "nif-device-v1"
+                                else self.args.janitor_period)
             try:
                 self.purge_expired()
+                if self.auth_mode == "nif-device-v1":
+                    await self.nif_janitor()
+                    if self.api_get_stats and now() - self.api_get_since >= self.args.api_log_period:
+                        self.api_flush_get_stats()
+                    continue
                 self.load_clients()
                 t = now()
                 for conn in list(self.conns.values()):
@@ -2004,10 +2297,15 @@ def main():
     ap.add_argument("--api-routes", default=None,
                     help="JSON file extending/replacing the /api route table (see load_api_routes)")
     ap.add_argument("--api-token-ttl", type=int, default=API_TOKEN_TTL_S,
-                    help="robot API bearer token lifetime in seconds")
+                    help="legacy-mode API bearer lifetime; NIF mode uses the authority's TTL")
     ap.add_argument("--api-log-period", type=float, default=API_GET_LOG_PERIOD_S,
                     help="seconds between aggregated audit lines for API GETs")
     ap.add_argument("--data-dir", default=os.environ.get("VIZANTI_GW_DATA", "~/.rgt_data/vizanti_gateway"))
+    ap.add_argument("--auth-mode", choices=("nif-device-v1", "legacy"), default="nif-device-v1",
+                    help="NIF is the default single authority; legacy requires explicit opt-in")
+    ap.add_argument("--nif-auth-socket", default="/run/rgt-network-iface/gateway.sock")
+    ap.add_argument("--nif-auth-uid", type=int, default=os.getuid(),
+                    help="expected SO_PEERCRED UID of the NIF auth service")
     ap.add_argument("--robot-uid-file", default="/rgt/robot_uid")
     ap.add_argument("--janitor-period", type=float, default=JANITOR_PERIOD_S,
                     help="seconds between expiry/revocation sweeps (= max revoke-to-severance delay)")
@@ -2020,6 +2318,8 @@ def main():
     gw = Gateway(args)
     if args.command == "selfcheck":
         return cmd_selfcheck(gw)
+    if args.auth_mode == "nif-device-v1" and args.command != "serve":
+        raise SystemExit("NIF owns device registrations. Use rgt-nif-auth; legacy clients.json is inactive.")
     if args.command != "serve":
         # the daemon runs as user rgt: a root-run CLI would resolve "~" to /root and, worse, could
         # leave root-owned files the daemon cannot read. refuse instead of silently diverging.
