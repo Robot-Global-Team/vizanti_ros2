@@ -1,5 +1,11 @@
 # Vizanti gateway 1.5.1 — 접속 코드 PAKE 등록 / NIF device authority
 
+## 패키지와 게이트웨이 버전 관리
+
+`vizanti_server/package.xml`의 ROS 패키지 버전과 `scripts/vizanti_gateway.py`의 `VERSION`은 모두 **1.5.1**이며, 배포할 때 같은 `MAJOR.MINOR.PATCH`로 함께 변경합니다. 전체 로봇 SW 릴리스 번호와 다른 Vizanti ROS 패키지의 버전은 별도로 관리합니다. CMake configure는 두 값이 다르면 실패하며, 정식 게이트웨이 설치기도 의존성 설치·서비스·방화벽 변경 전에 설치된 패키지와 게이트웨이의 버전 일치를 검사합니다.
+
+`colcon build --packages-select vizanti_server`로 패키지를 빌드·설치하면 `share/vizanti_server/package.xml`과 `share/vizanti_server/cmake/vizanti_serverConfig{,-version}.cmake`가 함께 생성됩니다. 스크립트만 교체하는 부분 업데이트에서도 이 세 메타데이터 파일을 함께 배포해야 ROS 조회·CMake 의존성 검색·`/gw/info`가 같은 버전을 표시합니다. 메타데이터만 갱신할 때 게이트웨이 재시작은 필요하지 않습니다.
+
 기본 인증 방식은 `nif-device-v1`입니다. network-iface 인증 서비스가 등록 기기, 코드, 서명 챌린지와 세션을 관리합니다. 게이트웨이의 기존 `clients.json`/`pairing_code`는 읽지 않으며 자동으로 가져오지도 않습니다. 기존 방식은 개발/호환 시험에서 `--auth-mode legacy`를 명시한 경우에만 사용합니다. 이전 동작의 기록은 [README.legacy.ko.md](README.legacy.ko.md)이며 신규 설치 절차로 사용하지 마세요.
 
 ```text

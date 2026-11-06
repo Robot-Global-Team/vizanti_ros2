@@ -12,6 +12,23 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(ament_cmake_python REQUIRED)
 
+# Keep the ROS package and its independently executable gateway on one version.
+ament_package_xml()
+set(_gateway_script "${CMAKE_CURRENT_SOURCE_DIR}/scripts/vizanti_gateway.py")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_gateway_script}")
+file(STRINGS "${_gateway_script}" _gateway_version_lines
+  REGEX "^VERSION = \"[0-9]+[.][0-9]+[.][0-9]+\"$")
+list(LENGTH _gateway_version_lines _gateway_version_count)
+if(NOT _gateway_version_count EQUAL 1)
+  message(FATAL_ERROR "Expected one gateway VERSION = \"MAJOR.MINOR.PATCH\" declaration")
+endif()
+string(REGEX REPLACE "^VERSION = \"([^\"]+)\"$" "\\1"
+  _gateway_version "${_gateway_version_lines}")
+if(NOT "${${PROJECT_NAME}_VERSION}" STREQUAL "${_gateway_version}")
+  message(FATAL_ERROR
+    "vizanti_server package.xml version ${${PROJECT_NAME}_VERSION} differs from gateway VERSION ${_gateway_version}; update both together")
+endif()
+
 find_package(rclcpp REQUIRED)
 find_package(rclpy REQUIRED)
 

@@ -1040,6 +1040,19 @@ fi
 
 # ---------------------------------------------------------------- 정식 설치
 [[ -f "$GW_BIN" ]] || { echo "오류: $GW_BIN 없음 — vizanti_server 패키지를 먼저 배포하세요" >&2; exit 1; }
+GW_WANT=$(awk -F'"' '/^VERSION = "/ { print $2; exit }' "$GW_BIN")
+[[ -n $GW_WANT ]] || die "$GW_BIN 에서 VERSION 을 읽을 수 없음"
+PKG_VERSION=$(python3 - "$WS_ROOT/share/vizanti_server/package.xml" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+package = ET.parse(sys.argv[1]).getroot()
+if package.findtext("name") != "vizanti_server":
+    raise SystemExit("Expected vizanti_server package.xml")
+print(package.findtext("version", ""))
+PY
+) || die "vizanti_server package.xml 버전을 읽을 수 없음 — 패키지를 함께 배포하세요"
+[[ $PKG_VERSION == "$GW_WANT" ]] \
+    || die "패키지 버전 $PKG_VERSION / 게이트웨이 버전 $GW_WANT 불일치 — package.xml·CMake 메타데이터·게이트웨이를 함께 배포하세요"
 if ! python3 -c 'import cryptography' 2>/dev/null; then
     echo "[dep] python3-cryptography 설치 시도 (오프라인 로봇이면 미리 deb 를 준비하세요)"
     apt-get install -y python3-cryptography || { echo "오류: python3-cryptography 를 설치할 수 없음" >&2; exit 1; }
@@ -1140,8 +1153,6 @@ fi
 #    (첫 설치는 start 와 같음. 세션은 메모리 전용이라 열린 화면은 한 번 끊김)
 cp "$SHARE_DIR/vizanti-gateway.service" "$UNIT_DST"
 verify_unit "$UNIT_DST"
-GW_WANT=$(awk -F'"' '/^VERSION = "/ { print $2; exit }' "$GW_BIN")
-[[ -n $GW_WANT ]] || { echo "오류: $GW_BIN 에서 VERSION 을 읽을 수 없음" >&2; exit 1; }
 systemctl daemon-reload
 systemctl reset-failed vizanti-gateway.service 2>/dev/null || true
 systemctl enable vizanti-gateway.service
